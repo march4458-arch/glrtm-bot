@@ -12,15 +12,25 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from streamlit_gsheets import GSheetsConnection
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 from scipy.signal import find_peaks
 from scipy.stats import norm
 from bs4 import BeautifulSoup 
+
+# [V81.58 Update] 딥러닝/규제 라이브러리
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.regularizers import l2 
+from sklearn.preprocessing import MinMaxScaler
 
 # ==========================================
 # ⚙️ 1. 시스템 설정 및 초기화
 # ==========================================
 MODEL_FILE = "ai_ensemble_model.pkl" 
+LSTM_MODEL_FILE = "ai_lstm_model.h5"
+SCALER_FILE = "ai_lstm_scaler.pkl"
 
 def get_now_kst():
     return datetime.datetime.now(timezone(timedelta(hours=9)))
@@ -32,7 +42,7 @@ def check_market_open():
     end_time = datetime.time(15, 30)
     return start_time <= now.time() <= end_time
 
-st.set_page_config(page_title="AI Master V80.74 Genuine", page_icon="💎", layout="wide")
+st.set_page_config(page_title="AI Master V81.58 Stable", page_icon="🧬", layout="wide")
 
 st.markdown("""
     <style>
@@ -65,7 +75,125 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- [KIS API Logic - Upgraded Hybrid] ---
+# ==========================================
+# 🧠 2. LSTM 엔진 (V81.58 수정 완료: L2 규제 적용)
+# ==========================================
+class LSTMEngine:
+    def __init__(self, lookback=20):
+        self.lookback = lookback
+        self.model = None
+        self.scaler = None
+
+    # 🔹 헬퍼 함수: 지연 로딩 (필요할 때만 TensorFlow 로드)
+    def _import_tf(self):
+        try:
+            import tensorflow as tf
+            from tensorflow.keras.models import Sequential, load_model
+            from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+            
+            # [V81.58 Fix] l2 규제 모듈 명시적 임포트
+            from tensorflow.keras.regularizers import l2 
+            from sklearn.preprocessing import MinMaxScaler
+            
+            # 반환 값 순서: tf, Seq, load, LSTM, Dense, Drop, Input, l2, MMS
+            return tf, Sequential, load_model, LSTM, Dense, Dropout, Input, l2, MinMaxScaler
+        except ImportError:
+            # 반환 개수(9개)를 맞춰서 None 리턴
+            return None, None, None, None, None, None, None, None, None
+
+    def create_model(self, input_shape):
+        # [V81.58 Fix] l2 변수 받아오기
+        tf, Sequential, _, LSTM, Dense, Dropout, Input, l2, _ = self._import_tf()
+        
+        if not tf: return None
+        
+        # 모델 구조 정의
+        model = Sequential()
+        model.add(Input(shape=input_shape))
+        
+        # [V81.58 Fix] LSTM 층에 kernel_regularizer=l2(0.001) 적용
+        model.add(LSTM(32, return_sequences=False, kernel_regularizer=l2(0.001))) 
+        model.add(Dropout(0.2))
+        model.add(Dense(1, activation='sigmoid'))
+        
+        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        return model
+
+    def prepare_data(self, df, training=False):
+        # MinMaxScaler 받아오기 (마지막 순서)
+        _, _, _, _, _, _, _, _, MinMaxScaler = self._import_tf()
+        
+        features = ['Close', 'Volume', 'RSI', 'MACD', 'Stoch_20']
+        if len(df) < self.lookback + 5: return None, None
+        
+        if 'RSI' not in df.columns: df = get_all_indicators(df)
+        if df is None: return None, None
+            
+        temp_df = df[features].fillna(0)
+        data = temp_df.values
+        
+        if training:
+            self.scaler = MinMaxScaler()
+            scaled_data = self.scaler.fit_transform(data)
+        else:
+            if self.scaler is None: 
+                try: self.scaler = joblib.load(SCALER_FILE)
+                except: return None, None
+            scaled_data = self.scaler.transform(data)
+
+        X, y = [], []
+        if training:
+            for i in range(self.lookback, len(scaled_data) - 1):
+                X.append(scaled_data[i-self.lookback:i])
+                target = 1 if data[i+1][0] > data[i][0] * 1.02 else 0 
+                y.append(target)
+            return np.array(X), np.array(y)
+        else:
+            last_sequence = scaled_data[-self.lookback:]
+            return np.array([last_sequence]), None
+
+    def train_and_save(self, df_list):
+        if len(df_list) > 10: df_list = df_list[:10] 
+        
+        all_X, all_y = [], []
+        for df in df_list:
+            X, y = self.prepare_data(df, training=True)
+            if X is not None:
+                all_X.append(X); all_y.append(y)
+        
+        if not all_X: return False, "데이터 부족"
+        
+        X_final = np.concatenate(all_X)
+        y_final = np.concatenate(all_y)
+        
+        self.model = self.create_model((self.lookback, X_final.shape[2]))
+        if self.model:
+            self.model.fit(X_final, y_final, epochs=3, batch_size=16, verbose=0)
+            self.model.save(LSTM_MODEL_FILE)
+            joblib.dump(self.scaler, SCALER_FILE)
+            return True, f"LSTM 경량 학습 완료 ({len(X_final)}샘플)"
+        return False, "TensorFlow 로딩 실패"
+
+    def predict_score(self, df):
+        try:
+            # 예측 시에는 load_model만 필요하지만 순서 맞춤
+            _, _, load_model, _, _, _, _, _, _ = self._import_tf()
+            
+            if self.model is None:
+                if os.path.exists(LSTM_MODEL_FILE): self.model = load_model(LSTM_MODEL_FILE)
+                else: return 50
+            
+            X_pred, _ = self.prepare_data(df, training=False)
+            if X_pred is None: return 50
+            
+            prob = self.model.predict(X_pred, verbose=0)[0][0]
+            return int(prob * 100)
+        except: return 50
+
+# 엔진 초기화 (이 줄도 꼭 있어야 합니다)
+lstm_engine = LSTMEngine()
+
+# --- [KIS API Client] (재시도 로직 강화) ---
 class KIS_Data_Client:
     def __init__(self, app_key, app_secret, mock=False):
         self.app_key = app_key
@@ -100,9 +228,10 @@ class KIS_Data_Client:
         }
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        for i in range(2): 
+        
+        for i in range(3): 
             try:
-                res = requests.get(url, headers=headers, params=params, timeout=2)
+                res = requests.get(url, headers=headers, params=params, timeout=3)
                 if res.status_code == 200:
                     data = res.json()
                     if 'output' in data: return int(data['output']['stck_prpr'])
@@ -111,7 +240,7 @@ class KIS_Data_Client:
                     headers["authorization"] = f"Bearer {self.token}"
                     continue 
             except: pass
-            time.sleep(0.1)
+            time.sleep(0.5 * (2 ** i)) 
         return None
 
     def get_daily_chart(self, code):
@@ -129,22 +258,24 @@ class KIS_Data_Client:
             "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "1"
         }
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-        try:
-            time.sleep(0.05) 
-            res = requests.get(url, headers=headers, params=params, timeout=3)
-            if res.status_code == 200:
-                data = res.json()
-                if 'output2' in data and data['output2']:
-                    df = pd.DataFrame(data['output2'])
-                    df = df.rename(columns={
-                        'stck_bsop_date': 'Date', 'stck_oprc': 'Open', 'stck_hgpr': 'High',
-                        'stck_lwpr': 'Low', 'stck_clpr': 'Close', 'acml_vol': 'Volume'
-                    })
-                    df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d')
-                    cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-                    for c in cols: df[c] = pd.to_numeric(df[c])
-                    return df.sort_values('Date').set_index('Date')
-        except: pass
+        
+        for i in range(3):
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    if 'output2' in data and data['output2']:
+                        df = pd.DataFrame(data['output2'])
+                        df = df.rename(columns={
+                            'stck_bsop_date': 'Date', 'stck_oprc': 'Open', 'stck_hgpr': 'High',
+                            'stck_lwpr': 'Low', 'stck_clpr': 'Close', 'acml_vol': 'Volume'
+                        })
+                        df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d')
+                        cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                        for c in cols: df[c] = pd.to_numeric(df[c])
+                        return df.sort_values('Date').set_index('Date')
+            except: pass
+            time.sleep(0.5 * (2 ** i))
         return None
 
 kis_client = None
@@ -177,8 +308,8 @@ def get_consensus_data(code):
                     try: target_price = int(em.text.strip().replace(',', ''))
                     except: pass
                 if em.parent and "투자의견" in str(em.parent):
-                     try: opinion = float(em.text.strip())
-                     except: pass
+                      try: opinion = float(em.text.strip())
+                      except: pass
         return target_price, opinion
     except: return 0, 0.0
 
@@ -264,18 +395,46 @@ def get_safe_stock_listing():
     if os.path.exists(file_path):
         try:
             df = pd.read_csv(file_path, converters={'Code': str})
-            if not df.empty and 'Sector' in df.columns: return df, "💾 Saved List"
-            else: os.remove(file_path)
+            if len(df) > 50 and 'Sector' in df.columns: 
+                return df, "💾 Saved List"
+            else: 
+                os.remove(file_path)
         except: pass
+
     try:
         df = fdr.StockListing('KRX')
-        if not df.empty:
+        if not df.empty and len(df) > 100:
             if 'Sector' not in df.columns: df['Sector'] = "Unknown"
             df.to_csv(file_path, index=False)
             return df, "⚡ KRX Live"
+    except Exception as e: print(f"KRX Load Fail: {e}")
+
+    try:
+        time.sleep(1)
+        df_k = fdr.StockListing('KOSPI')
+        df_q = fdr.StockListing('KOSDAQ')
+        df = pd.concat([df_k, df_q])
+        if not df.empty and len(df) > 100:
+            if 'Sector' not in df.columns: df['Sector'] = "Unknown"
+            df = df.drop_duplicates(subset=['Code'])
+            df.to_csv(file_path, index=False)
+            return df, "⚡ Split Load"
     except: pass
-    fb = [['005930','삼성전자', '전기전자'], ['000660','SK하이닉스', '전기전자']]
-    return pd.DataFrame(fb, columns=['Code','Name','Sector']).assign(Marcap=10**15), "⚠️ Backup List"
+
+    fb_data = [
+        ['005930', '삼성전자', '전기전자', 400000000000000], ['000660', 'SK하이닉스', '전기전자', 100000000000000],
+        ['373220', 'LG에너지솔루션', '전기전자', 90000000000000], ['207940', '삼성바이오로직스', '의약품', 50000000000000],
+        ['005380', '현대차', '운수장비', 40000000000000], ['000270', '기아', '운수장비', 35000000000000],
+        ['005490', 'POSCO홀딩스', '철강금속', 30000000000000], ['035420', 'NAVER', '서비스업', 25000000000000],
+        ['006400', '삼성SDI', '전기전자', 20000000000000], ['051910', 'LG화학', '화학', 20000000000000],
+        ['068270', '셀트리온', '의약품', 30000000000000], ['035720', '카카오', '서비스업', 20000000000000],
+        ['105560', 'KB금융', '금융업', 20000000000000], ['028260', '삼성물산', '유통업', 20000000000000],
+        ['012330', '현대모비스', '운수장비', 20000000000000], ['055550', '신한지주', '금융업', 18000000000000],
+        ['066570', 'LG전자', '전기전자', 15000000000000], ['003670', '포스코퓨처엠', '전기전자', 15000000000000],
+        ['096770', 'SK이노베이션', '석유화학', 13000000000000], ['032830', '삼성생명', '보험', 13000000000000]
+    ]
+    df_fb = pd.DataFrame(fb_data, columns=['Code', 'Name', 'Sector', 'Marcap'])
+    return df_fb, "⚠️ Emergency List (20)"
 
 @st.cache_data(ttl=3600)
 def get_sector_performance_map(df_krx):
@@ -296,12 +455,13 @@ def get_sector_performance_map(df_krx):
     except Exception as e: print(f"Sector Analysis Error: {e}")
     return sector_map
 
+# [V81.58 Fix] Decorator: Return empty DataFrame instead of None on failure
 def retry_gsheets(func):
     def wrapper(*args, **kwargs):
         for i in range(3):
             try: return func(*args, **kwargs)
             except: time.sleep(1)
-        return None
+        return pd.DataFrame() # Return empty DF to prevent NoneType error
     return wrapper
 
 @retry_gsheets
@@ -359,40 +519,56 @@ def get_scan_history():
         return df
     return pd.DataFrame(columns=['Date', 'Code', 'Name', 'Entry_Price', 'Target_Price', 'Stop_Price', 'Strategy'])
 
+# 기존 analyze_market_condition 함수를 아래 코드로 덮어쓰세요.
 def analyze_market_condition(idx_code):
+    # 1. 기술적 분석 (기존 유지)
     df, _ = get_data_safe(idx_code, days=300)
-    if df is None or len(df) < 120: return 0, "Unknown", "gray"
+    tech_score = 0
+    adx = 0
+    if df is not None and len(df) >= 60:
+        close = df['Close']; ma20 = close.rolling(20).mean(); ma60 = close.rolling(60).mean()
+        tr1 = df['High'] - df['Low']; tr2 = (df['High'] - df['Close'].shift(1)).abs(); tr3 = (df['Low'] - df['Close'].shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1); atr = tr.rolling(14).mean()
+        up_move = df['High'] - df['High'].shift(1); down_move = df['Low'].shift(1) - df['Low']
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
+        minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+        adx = dx.rolling(14).mean().iloc[-1]
+        
+        curr = close.iloc[-1]
+        if curr > ma20.iloc[-1] and ma20.iloc[-1] > ma60.iloc[-1]: tech_score = -10 
+        elif curr < ma20.iloc[-1] and ma20.iloc[-1] < ma60.iloc[-1]: tech_score = 15 
+        
+    # 2. 매크로 분석 (에러 방지 강화)
+    macro_score = 0
+    macro_msg = []
     
-    close = df['Close']
-    ma20 = close.rolling(20).mean(); ma60 = close.rolling(60).mean()
-    k = close.ewm(span=12, adjust=False).mean(); d = close.ewm(span=26, adjust=False).mean()
-    macd = k - d; signal = macd.ewm(span=9, adjust=False).mean()
-    
-    high = df['High']; low = df['Low']
-    tr1 = high - low; tr2 = (high - close.shift(1)).abs(); tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1); atr = tr.rolling(14).mean()
-    
-    up_move = high - high.shift(1); down_move = low.shift(1) - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    adx = dx.rolling(14).mean().iloc[-1]
-    
-    curr_price = close.iloc[-1]; curr_ma20 = ma20.iloc[-1]; curr_ma60 = ma60.iloc[-1]
-    curr_macd = macd.iloc[-1]; curr_sig = signal.iloc[-1]
-    
-    if adx < 20: return 5, f"💤 횡보/비추세 (ADX:{adx:.1f})", "#78909c"
-    if curr_price > curr_ma20 and curr_ma20 > curr_ma60 and curr_macd > curr_sig:
-        if adx > 25: return -10, f"🔥 대세상승 (강도:{adx:.0f})", "#d32f2f"
-        else: return -5, "🔺 완만한 상승", "#ef5350"
-    if curr_price < curr_ma20 and curr_ma20 > curr_ma60: return 0, "🦅 눌림목 경계", "#ff9800"
-    if curr_price < curr_ma20 and curr_ma20 < curr_ma60:
-        if adx > 25: return 20, f"❄️ 폭락장 (강도:{adx:.0f})", "#1a237e"
-        else: return 10, "💧 하락세", "#1976d2"
-    if curr_price > curr_ma20 and curr_ma20 < curr_ma60: return 0, "✨ 반등 시도", "#4caf50"
-    return 0, "❓ 판단 유보", "gray"
+    # [수정됨] 야후 파이낸스 호출 안정화
+    try:
+        # threads=False로 설정하여 차단 확률 낮춤
+        usd_data = yf.download("KRW=X", period="5d", progress=False, threads=False)
+        if not usd_data.empty:
+            if isinstance(usd_data.columns, pd.MultiIndex): usd_data.columns = usd_data.columns.get_level_values(0)
+            usd_krw = float(usd_data['Close'].iloc[-1])
+            if usd_krw > 1400: macro_score += 10; macro_msg.append(f"환율주의({int(usd_krw)})")
+            
+        bond_data = yf.download("^TNX", period="5d", progress=False, threads=False)
+        if not bond_data.empty:
+            if isinstance(bond_data.columns, pd.MultiIndex): bond_data.columns = bond_data.columns.get_level_values(0)
+            us_bond = float(bond_data['Close'].iloc[-1])
+            if us_bond > 4.5: macro_score += 5; macro_msg.append(f"금리부담({us_bond:.1f}%)")
+            
+    except Exception as e:
+        # 에러 발생 시 로그만 남기고 0점 처리 (앱 멈춤 방지)
+        print(f"Macro Data Error: {e}") 
+
+    final_score = tech_score + macro_score
+    status_txt = f"Tech:{tech_score} + Macro:{macro_score}"
+    if macro_msg: status_txt += f" ({', '.join(macro_msg)})"
+    status_color = "#4caf50" if final_score <= 0 else "#f44336" if final_score >= 10 else "#ff9800"
+    return final_score, status_txt, status_color
 
 def get_ai_condition():
     k_score, k_stat, k_col = analyze_market_condition("KS11")
@@ -425,6 +601,17 @@ def get_all_indicators(df):
     k = close.ewm(span=12, adjust=False).mean(); d = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = k - d; df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    
+    p9_high = high.rolling(9).max(); p9_low = low.rolling(9).min()
+    df['Ichi_Tenkan'] = (p9_high + p9_low) / 2
+    p26_high = high.rolling(26).max(); p26_low = low.rolling(26).min()
+    df['Ichi_Kijun'] = (p26_high + p26_low) / 2
+    df['Ichi_SpanA'] = ((df['Ichi_Tenkan'] + df['Ichi_Kijun']) / 2).shift(26)
+    p52_high = high.rolling(52).max(); p52_low = low.rolling(52).min()
+    df['Ichi_SpanB'] = ((p52_high + p52_low) / 2).shift(26)
+    df['Kumo_Top'] = df[['Ichi_SpanA', 'Ichi_SpanB']].max(axis=1)
+    df['Kumo_Bot'] = df[['Ichi_SpanA', 'Ichi_SpanB']].min(axis=1)
+    
     recent_high = high.rolling(60).max(); recent_low = low.rolling(60).min(); diff = recent_high - recent_low
     df['Fibo_0.382'] = recent_high - (diff * 0.382); df['Fibo_0.5'] = recent_high - (diff * 0.5); df['Fibo_0.618'] = recent_high - (diff * 0.618)
     
@@ -435,7 +622,9 @@ def get_all_indicators(df):
     df.loc[mask_ob, 'OB_Bull'] = df['Open'].shift(1)
     df['OB_Support'] = df['OB_Bull'].replace(0, np.nan).ffill(limit=10).fillna(0)
     
+    # Stochastic Slow 로직 적용
     df['Stoch_5'] = calc_stoch(df, 5, 3, 3); df['Stoch_10'] = calc_stoch(df, 10, 6, 6); df['Stoch_20'] = calc_stoch(df, 20, 12, 12)
+    
     tr1 = high - low; tr2 = (high - close.shift(1)).abs(); tr3 = (low - close.shift(1)).abs()
     df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
     tp = (high + low + close) / 3
@@ -479,68 +668,116 @@ def get_benchmark_data(days=2600):
     kq11, _ = get_data_safe('KQ11', days)
     return ks11, kq11
 
+# [V81.58 Patch] 학습 로직 (Safe Guard: NoneType + 컷오프)
 def train_global_model(stock_list, limit=50, mode="update"):
     all_X = []; all_y = []
+    collected_dfs = [] 
+    
     features = ['RSI', 'Stoch_20', 'CCI', 'MFI', 'ADX', 'Vol_Z', 'BB_Pos', 'ER', 'Rel_Close', 'KOSPI_Trend']
     status_text = st.empty(); progress_bar = st.progress(0)
+    
     ks11_df, kq11_df = get_benchmark_data()
     if ks11_df is None or kq11_df is None: return False, "지수 데이터 로딩 실패"
-    ks11_df['MA20'] = ks11_df['Close'].rolling(20).mean()
-    ks11_df['Trend'] = (ks11_df['Close'] > ks11_df['MA20']).astype(int)
-    ks11_df['Idx_Chg'] = ks11_df['Close'].pct_change() * 100
-    kq11_df['Idx_Chg'] = kq11_df['Close'].pct_change() * 100
-    ks11_df['Date_Key_K'] = ks11_df.index.strftime('%Y-%m-%d')
-    trend_map_ks = ks11_df.set_index('Date_Key_K')['Trend'].to_dict()
-
-    if mode == "initial": targets = stock_list.head(limit)['Code'].tolist(); days_to_fetch = 2500 
-    elif mode == "full_initial": targets = stock_list['Code'].tolist(); days_to_fetch = 2500 
-    else: targets = stock_list.head(limit)['Code'].tolist(); days_to_fetch = 10 
+    
+    for b_df in [ks11_df, kq11_df]:
+        b_df.index = pd.to_datetime(b_df.index)
+        b_df['Idx_Chg'] = b_df['Close'].pct_change() * 100
+    
+    trend_map_ks = ks11_df['Close'].rolling(20).mean().to_dict() 
+    
+    if mode == "initial": targets = stock_list.head(limit)['Code'].tolist(); days_to_fetch = 730
+    elif mode == "full_initial": targets = stock_list.head(300)['Code'].tolist(); days_to_fetch = 730
+    else: targets = stock_list.head(limit)['Code'].tolist(); days_to_fetch = 15
 
     success_count = 0; total_targets = len(targets)
+    print(f"=== 학습 시작: 대상 {total_targets}개 ===") 
+
     with ThreadPoolExecutor(max_workers=2) as ex: 
         fut_map = {ex.submit(get_data_safe, code, days_to_fetch): code for code in targets}
         for i, fut in enumerate(as_completed(fut_map)):
             code = fut_map[fut]
             try:
-                df, _ = fut.result()
-                if df is not None and not df.empty and len(df) > 60:
-                    df = get_all_indicators(df)
-                    if df is not None:
-                        market_type = 'KQ' if code not in ['005930'] and int(code) > 100000 else 'KS' 
-                        benchmark = kq11_df if market_type == 'KQ' else ks11_df
-                        df['Date_Key'] = df.index.strftime('%Y-%m-%d')
-                        df['KOSPI_Trend'] = df['Date_Key'].map(trend_map_ks).fillna(0)
-                        benchmark['Date_Key'] = benchmark.index.strftime('%Y-%m-%d')
-                        idx_map = benchmark.set_index('Date_Key')['Idx_Chg']
-                        df['Idx_Chg'] = df['Date_Key'].map(idx_map).fillna(0)
-                        df['Stock_Chg'] = df['Close'].pct_change() * 100
-                        df['Rel_Close'] = df['Stock_Chg'] - df['Idx_Chg']
-                        data_ml = df[features].copy().dropna()
-                        future_close = df['Close'].shift(-5)
-                        target = (future_close > df['Close'] * 1.02).astype(int)
-                        common_idx = data_ml.index.intersection(target.index[:-5])
-                        if len(common_idx) > 10:
-                            all_X.append(data_ml.loc[common_idx]); all_y.append(target.loc[common_idx]); success_count += 1
-            except: pass
+                result = fut.result()
+                if not result: continue 
+                
+                df, _ = result 
+                if df is None: continue 
+                if df.empty: continue 
+                if len(df) <= 60: continue 
+
+                # 성능 최적화: 거래대금 컷오프
+                if 'Close' not in df.columns or 'Volume' not in df.columns: continue
+                avg_amt = (df['Close'] * df['Volume']).rolling(5).mean().iloc[-1]
+                if avg_amt < 1000000000: continue 
+
+                df.index = pd.to_datetime(df.index)
+                df = get_all_indicators(df)
+                
+                if df is not None:
+                    if len(collected_dfs) < 200: collected_dfs.append(df.copy())
+                    
+                    market_type = 'KQ' if code not in ['005930'] and int(code) > 100000 else 'KS' 
+                    benchmark = kq11_df if market_type == 'KQ' else ks11_df
+                    
+                    aligned_idx = benchmark['Idx_Chg'].reindex(df.index).fillna(0)
+                    
+                    df['Idx_Chg'] = aligned_idx
+                    df['Stock_Chg'] = df['Close'].pct_change() * 100
+                    df['Rel_Close'] = df['Stock_Chg'] - df['Idx_Chg']
+                    
+                    ma20_series = pd.Series(trend_map_ks).reindex(df.index).ffill()
+                    ks_close = ks11_df['Close'].reindex(df.index).ffill()
+                    df['KOSPI_Trend'] = (ks_close > ma20_series).astype(int)
+
+                    data_ml = df[features].copy().dropna()
+                    future_close = df['Close'].shift(-5)
+                    target = (future_close > df['Close'] * 1.02).astype(int)
+                    common_idx = data_ml.index.intersection(target.index[:-5])
+                    
+                    if len(common_idx) > 10:
+                        all_X.append(data_ml.loc[common_idx])
+                        all_y.append(target.loc[common_idx])
+                        success_count += 1
+            except Exception as e:
+                print(f"Error processing {code}: {e}") 
+                
             if i % 10 == 0:
                 progress_bar.progress((i + 1) / total_targets)
-                status_text.text(f"📥 데이터 수집 중... ({i+1}/{total_targets})")
+                status_text.text(f"📥 수집 중... ({success_count}/{total_targets} 성공)")
                 gc.collect() 
 
-    if not all_X: return False, "데이터 수집 실패"
+    if not all_X: 
+        print("!!! 데이터 수집 실패: all_X가 비어있음 !!!")
+        return False, "데이터 수집 실패 (0건)"
+    
+    status_text.text("💾 데이터 병합 및 학습 시작...")
     X_new = pd.concat(all_X).sort_index(); y_new = pd.concat(all_y).sort_index()
     del all_X, all_y; gc.collect()
-    status_text.text(f"🧠 AI 모델 재학습 중... (데이터 {len(X_new):,}건)")
-    rf = RandomForestClassifier(n_estimators=100, max_depth=7, random_state=42, n_jobs=1, oob_score=True).fit(X_new, y_new)
-    gb = GradientBoostingClassifier(n_estimators=50, max_depth=5, random_state=42).fit(X_new, y_new)
+    
+    print(f"학습 데이터 크기: {len(X_new)} rows") 
+
+    xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, n_jobs=1, random_state=42)
+    xgb_model.fit(X_new, y_new)
+    
+    rf = RandomForestClassifier(n_estimators=50, max_depth=6, random_state=42, n_jobs=1, oob_score=True).fit(X_new, y_new)
+    
+    status_text.text(f"🧠 LSTM 학습 중... ({len(collected_dfs)}개)")
+    if collected_dfs:
+        lstm_res, lstm_msg = lstm_engine.train_and_save(collected_dfs)
+    else:
+        lstm_res = False
+    del collected_dfs; gc.collect()
+    
     model_data = {
-        "rf": rf, "gb": gb, "date": get_now_kst().strftime('%Y-%m-%d'), 
+        "xgb": xgb_model, "rf": rf, "date": get_now_kst().strftime('%Y-%m-%d'), 
         "sample_size": len(targets), "feature_names": features,
-        "feature_importance": np.mean([rf.feature_importances_, gb.feature_importances_], axis=0),
-        "oob_score": rf.oob_score_ if hasattr(rf, 'oob_score_') else 0
+        "feature_importance": xgb_model.feature_importances_, 
+        "oob_score": rf.oob_score_ if hasattr(rf, 'oob_score_') else 0,
+        "lstm_status": lstm_res
     }
     joblib.dump(model_data, MODEL_FILE)
-    return True, f"학습 완료! (총 {success_count}개 종목 반영)"
+    print(f"파일 저장 완료: {MODEL_FILE}") 
+    return True, f"학습 완료! (총 {success_count}개 종목 성공)"
 
 @st.cache_resource
 def load_ai_model():
@@ -553,14 +790,18 @@ def get_ai_score_fast(df, market_code='KS11'):
     features = ['RSI', 'Stoch_20', 'CCI', 'MFI', 'ADX', 'Vol_Z', 'BB_Pos', 'ER', 'Rel_Close', 'KOSPI_Trend']
     model_data = load_ai_model()
     if model_data is None: return 50 
+    
     try:
         if 'Rel_Close' not in df.columns: df['Rel_Close'] = df['Close'].pct_change() * 100 
         if 'KOSPI_Trend' not in df.columns: df['KOSPI_Trend'] = 1 
-        data_ml = df[features].iloc[-1:].values
+        data_ml = df[features].iloc[-1:].fillna(0)
+        p_xgb = model_data['xgb'].predict_proba(data_ml)[0][1]
         p_rf = model_data['rf'].predict_proba(data_ml)[0][1]
-        p_gb = model_data['gb'].predict_proba(data_ml)[0][1]
-        return int((p_rf * 0.6 + p_gb * 0.4) * 100)
-    except: return 50
+        lstm_score = lstm_engine.predict_score(df) / 100.0
+        final_prob = (p_xgb * 0.5) + (p_rf * 0.2) + (lstm_score * 0.3)
+        return int(final_prob * 100)
+    except Exception as e:
+        return 50
 
 # [V80.74] Updated Rebalancing Logic
 def analyze_rebalancing_suggestion(pf_list):
@@ -704,28 +945,62 @@ def calculate_sizing(score, curr_price, min_invest, max_invest, ai_prob):
     q1 = int((allocation * 0.3) // curr_price); q2 = int((allocation * 0.3) // curr_price); q3 = int((allocation * 0.4) // curr_price)
     return q1, q2, q3, int(allocation)
 
-# [V80.73] Strategy Engine (Final)
+def analyze_portfolio_action(score, ai_prob, loss_pct, rsi):
+    action_txt = "관망"; action_col = "black"; tag = "Hold"
+    if score >= 80:
+        if loss_pct < 0: action_txt = "💧물타기 추천"; action_col = "green"; tag = "Add"
+        else: action_txt = "🔥불타기 가능"; action_col = "#2e7d32"; tag = "BuyMore"
+    elif score < 40:
+        if loss_pct < -5: action_txt = "✂️손절/교체 검토"; action_col = "red"; tag = "Cut"
+        elif loss_pct > 3: action_txt = "💰익절 권장"; action_col = "#fbc02d"; tag = "Profit"
+    return action_txt, action_col, tag
+
+# [V81.10 Update] 이안 트레이더 패치
 def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=3000000, max_inv=5000000, market_status="Neutral", sec_score=0):
     if df is None or len(df) < 100: return None
-    curr = df.iloc[-1]; cp = curr['Close']; atr = curr['ATR']; prev = df.iloc[-2]
+    
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    cp = curr['Close']
+    atr = curr['ATR']
     ai_prob = get_ai_score_fast(df)
-    score = 0; hit_reasons = []; logic_mode = "⚖️ Balanced"
-    alpha_stock = False; breakout = False
+    
+    score = 0
+    hit_reasons = []
+    logic_mode = "⚖️ Balanced"
+    alpha_stock = False
+    breakout = False
     
     horizon, horizon_tag = determine_best_horizon(df)
-    
     is_bear = "하락" in market_status or "눌림" in market_status
     if is_bear:
         if curr['Close'] > curr['MA20'] and curr.get('Rel_Close', 0) > 2.0:
             score += 20; hit_reasons.append("🛡️하락장방어"); alpha_stock = True; logic_mode = "🐻 Crisis Hunter"
         else: score -= 15 
-    
-    if sec_score > 1.0: score += 10; hit_reasons.append(f"🏭주도섹터({sec_score:.1f}%)")
+
+    vol_mean = df['Volume'].rolling(20).mean().iloc[-1]
+    is_vol_explosive = curr['Volume'] > vol_mean * 1.5
+
+    if sec_score > 1.0: 
+        if is_vol_explosive:
+            score += 25
+            hit_reasons.append(f"🔥주도섹터+수급폭발({sec_score:.1f}%)")
+        else:
+            score += 10
+            hit_reasons.append(f"🏭주도섹터({sec_score:.1f}%)")
     elif sec_score < -1.0: score -= 10
+
+    if cp > curr['Kumo_Top']:
+        if prev['Close'] <= prev['Kumo_Top']:
+            score += 25; hit_reasons.append("☁️구름대강력돌파"); breakout = True
+        else:
+            score += 10; hit_reasons.append("☁️구름대위(정배열)")
+    elif cp < curr['Kumo_Bot']:
+        score -= 10
     
     rng = prev['High'] - prev['Low']; breakout_price = curr['Open'] + (rng * 0.5)
     if cp > breakout_price: score += 20; hit_reasons.append("💥변동성돌파"); breakout = True
-    
+
     consensus_info = {"price": 0, "upside": 0, "prob": 0, "opinion": 0.0}
     if code:
         target_price_consensus, opinion_score = get_consensus_data(code)
@@ -738,20 +1013,32 @@ def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=30000
 
     if cp > curr['MA200']: score += 10; hit_reasons.append("📈장기정배열")
     if cp >= curr['MVWAP']: score += 10; hit_reasons.append("기관수급")
-    if ai_prob >= 65: score += 15; hit_reasons.append(f"🤖AI추천({ai_prob}%)")
-
+    if ai_prob >= 70: score += 20; hit_reasons.append(f"🤖AI확신({ai_prob}%)")
+    
     if curr['MACD_Hist'] > 0 and prev['MACD_Hist'] <= 0: score += 15; hit_reasons.append("🌊MACD반전")
     elif curr['MACD'] > curr['MACD_Signal'] and curr['MACD'] > 0: score += 5
-
+    
     if curr['Fibo_0.618'] <= cp <= curr['Fibo_0.5'] * 1.02: score += 20; hit_reasons.append("✨황금비율지지")
     if curr['OB_Support'] > 0 and abs(cp - curr['OB_Support']) / cp < 0.03: score += 20; hit_reasons.append("🧱오더블럭지점")
 
     s5, s10, s20 = curr['Stoch_5'], curr['Stoch_10'], curr['Stoch_20']
-    if s5 < 25 and s10 < 25 and s20 < 30:
-        if s5 > prev['Stoch_5']: score += 40; hit_reasons.append("💎대바닥반등"); logic_mode = "🛡️ Sniper"
-    elif s20 > 50 and s5 < 20: 
-        score += 35; hit_reasons.append("⚡상승중눌림목"); logic_mode = "🐆 Hunter"
     
+    is_strong_trend = (curr.get('ADX', 0) >= 25) and (curr['Close'] > curr['MA20']) and (curr['MA20'] > curr['MA60'])
+    bull_ride_triggered = False
+
+    if is_strong_trend:
+        if 35 <= s5 <= 65 and s5 > prev['Stoch_5']:
+            score += 30
+            hit_reasons.append(f"🚀강세눌림목(ADX:{curr.get('ADX',0):.1f})")
+            logic_mode = "🐂 Bull Ride" 
+            bull_ride_triggered = True
+
+    if not bull_ride_triggered:
+        if s5 < 25 and s10 < 25 and s20 < 30:
+            if s5 > prev['Stoch_5']: score += 40; hit_reasons.append("💎대바닥반등"); logic_mode = "🛡️ Sniper"
+        elif s20 > 50 and s5 < 20: 
+            score += 35; hit_reasons.append("⚡상승중눌림목"); logic_mode = "🐆 Hunter"
+
     sup_score, sup_msg = analyze_supply(df); score += sup_score; hit_reasons.extend(sup_msg)
     pat_score, pat_msg = analyze_patterns(df); score += pat_score; pattern_reasons = pat_msg 
     adv_score, adv_msg = analyze_advanced_features(df); score += adv_score; pattern_reasons.extend(adv_msg)
@@ -765,7 +1052,6 @@ def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=30000
     whipsaw_warnings = []
     if curr['RSI'] > 80: whipsaw_warnings.append("RSI과열")
     if curr['Stoch_20'] > 90: whipsaw_warnings.append("스토캐과열")
-    vol_mean = df['Volume'].rolling(20).mean().iloc[-1]
     if cp > curr['MA20'] and curr['Volume'] < vol_mean * 0.4: whipsaw_warnings.append("거래량부족")
 
     def adj(p):
@@ -774,19 +1060,19 @@ def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=30000
         return int(round(p/t)*t)
 
     pp = (prev['High'] + prev['Low'] + prev['Close']) / 3
-    s1 = (2 * pp) - prev['High']; s2 = pp - (prev['High'] - prev['Low'])
+    s1 = (2 * pp) - prev['High']
     low_60 = df['Low'].tail(60).min(); low_120 = df['Low'].tail(120).min()
     
     support_candidates = []
     calc_days = 5; gap_mul = 0.8
     if horizon == 'short':
-        support_candidates = [(curr['MA5'], "5일선"), (curr['MA10'], "10일선"), (curr['MA20'], "20일선"), (curr['BB_Lo'], "BB하단"), (s1, "피봇S1"), (low_60, "60일최저")]
+        support_candidates = [(curr['MA5'], "5일선"), (curr['MA10'], "10일선"), (curr['MA20'], "20일선"), (curr['BB_Lo'], "BB하단"), (s1, "피봇S1")]
         calc_days = 3; gap_mul = 0.5
     elif horizon == 'long':
-        support_candidates = [(curr['MA60'], "60일선"), (curr['MA120'], "120일선"), (curr['MA200'], "200일선"), (curr['Fibo_0.618'], "Fibo 0.618"), (curr['OB_Support'], "오더블럭")]
+        support_candidates = [(curr['MA60'], "60일선"), (curr['MA120'], "120일선"), (curr['MA200'], "200일선"), (curr['Fibo_0.618'], "Fibo 0.618")]
         calc_days = 40; gap_mul = 2.0
     else: 
-        support_candidates = [(curr['MA20'], "20일선"), (curr['MA60'], "60일선"), (curr['Fibo_0.5'], "Fibo 0.5"), (curr['OB_Support'], "오더블럭")]
+        support_candidates = [(curr['MA20'], "20일선"), (curr['MA60'], "60일선"), (curr['Fibo_0.5'], "Fibo 0.5")]
         calc_days = 10; gap_mul = 1.0
 
     valid_buys = []
@@ -810,6 +1096,10 @@ def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=30000
     while len(final_buys) < 3:
         ref = final_buys[-1][0]; final_buys.append((adj(ref * 0.97), "지지선없음"))
 
+    if bull_ride_triggered:
+        final_buys.insert(0, (adj(cp), "🚀시장가진입"))
+        if len(final_buys) > 3: final_buys.pop()
+
     resist_candidates = [
         (curr['BB_Up'], "BB상단"), (curr['MA120'], "120선"), (curr['MA200'], "200선"),
         (cp + atr*2.5 * (2 if horizon=='long' else 1), "ATR목표"),
@@ -819,9 +1109,11 @@ def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=30000
     for p, label in resist_candidates:
         if p >= cp * 1.02: valid_sells.append((p, label)) 
     valid_sells.sort(key=lambda x: x[0]) 
+    
     final_sells = []
     if valid_sells: final_sells.append((adj(valid_sells[0][0]), valid_sells[0][1]))
     else: final_sells.append((adj(cp * 1.05), "목표가(+5%)"))
+    
     last_sell = final_sells[0][0]
     for p, label in valid_sells:
         if len(final_sells) >= 3: break
@@ -829,10 +1121,20 @@ def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=30000
     while len(final_sells) < 3:
         ref = final_sells[-1][0]; final_sells.append((adj(ref * 1.05), "추가상승"))
 
+    if score >= 80 and curr['Close'] > curr['MA5']:
+        new_target = final_sells[0][0] * 1.05 
+        final_sells[0] = (adj(new_target), "📈추세지속홀딩")
+        hit_reasons.append("Profit Run(목표상향)")
+
+    volatility_mult = 1.0 + (score / 200.0)
+    tb_stop = cp - (atr * 1.5)
+    
     entry_p = final_buys[0][0]; last_entry_p = final_buys[-1][0]
     final_stop = (adj(entry_p * 0.97), "-3%손절") 
     if "20일선" in final_buys[0][1]: final_stop = (adj(curr['BB_Lo']), "BB하단이탈")
     elif "60일선" in final_buys[0][1]: final_stop = (adj(low_120), "전저점이탈")
+    
+    if tb_stop > final_stop[0]: final_stop = (adj(tb_stop), "🛡️트리플배리어")
     min_stop_limit = adj(last_entry_p * 0.97)
     if final_stop[0] >= last_entry_p: final_stop = (min_stop_limit, "최종지지이탈")
 
@@ -879,7 +1181,7 @@ def format_3split_msg(name, s, prefix=""):
     return msg + "\n"
 
 # ==========================================
-# 🖥️ 4. 메인 UI
+# 🖥️ 4. 메인 UI (Sidebar)
 # ==========================================
 with st.sidebar:
     now = get_now_kst()
@@ -893,8 +1195,8 @@ with st.sidebar:
     krx_list, list_src = get_safe_stock_listing()
     st.markdown(f'<div class="list-box">📋 {list_src}</div>', unsafe_allow_html=True)
 
-    st.title("✨ AI Master V80.74")
-    st.caption("Genuine Full Version")
+    st.title("✨ AI Master V81.58")
+    st.caption("Hybrid Engine (XGB+RF+LSTM-L2)")
     
     with st.expander("💰 자금 관리 설정 (Money Mgmt)", expanded=True):
         invest_min = st.number_input("종목당 최소 투자금", value=3000000, step=500000)
@@ -904,8 +1206,12 @@ with st.sidebar:
     with st.expander("🔐 한국투자증권(KIS) 데이터 설정", expanded=False):
         st.caption("계좌번호 없이 시세 조회용으로만 사용합니다.")
         k_conf = "kis_config.json"
+        
         def_k, def_s, def_m = "", "", False
-        if os.path.exists(k_conf):
+        if "kis" in st.secrets:
+            def_k = st.secrets["kis"]["app_key"]
+            def_s = st.secrets["kis"]["app_secret"]
+        elif os.path.exists(k_conf):
             try:
                 with open(k_conf, "r") as f:
                     d = json.load(f)
@@ -934,19 +1240,24 @@ with st.sidebar:
     with st.expander("⚙️ 설정 및 알림", expanded=False):
         config_file = "telegram_config.json"
         default_token = ""; default_id = ""
-        if os.path.exists(config_file):
+        
+        if "telegram" in st.secrets:
+            default_token = st.secrets["telegram"]["token"]
+            default_id = st.secrets["telegram"]["chat_id"]
+        elif os.path.exists(config_file):
             try:
                 with open(config_file, "r") as f:
                     config = json.load(f)
                     default_token = config.get("token", ""); default_id = config.get("chat_id", "")
             except: pass
+
         tg_token = st.text_input("Bot Token", value=default_token, type="password")
         tg_id = st.text_input("Chat ID", value=default_id)
         if st.button("설정 저장"):
             with open(config_file, "w") as f: json.dump({"token": tg_token, "chat_id": tg_id}, f)
         
         st.markdown("---")
-        st.markdown("🧠 **AI 모델 관리**")
+        st.markdown("🧠 **AI 모델 관리 (Hybrid)**")
         
         model_exists = False
         model_info = "⚠️ 모델 없음 (학습필요)"; model_size = "-"
@@ -967,10 +1278,10 @@ with st.sidebar:
         
         st.markdown("##### 1️⃣ 약식 테스트")
         if st.button(f"⚡ Top {train_limit}개만 학습"):
-            with st.spinner(f"Top {train_limit}개 종목으로 빠르게 학습합니다... (Safe Mode)"):
+            with st.spinner(f"Top {train_limit}개 종목으로 빠르게 학습합니다... (LSTM 포함)"):
                 success, msg = train_global_model(krx_list, limit=train_limit, mode="initial") 
                 if success:
-                    st.success(msg); st.cache_resource.clear(); time.sleep(2); st.rerun()
+                    st.success(msg); st.cache_resource.clear(); st.cache_data.clear(); time.sleep(2); st.rerun()
                 else: st.error(msg)
 
         st.markdown("##### 2️⃣ 실전 정밀 학습")
@@ -982,7 +1293,7 @@ with st.sidebar:
                     target_pool['Code'] = target_pool['Code'].astype(str).str.zfill(6)
                     success, msg = train_global_model(target_pool, limit=len(target_pool), mode="full_initial")
                     if success:
-                        st.success(f"✅ 학습 완료! ({len(target_pool)}개)"); st.cache_resource.clear(); time.sleep(2); st.rerun()
+                        st.success(f"✅ 학습 완료! ({len(target_pool)}개)"); st.cache_resource.clear(); st.cache_data.clear(); time.sleep(2); st.rerun()
                     else: st.error(msg)
                 except Exception as e: st.error(f"데이터 준비 실패: {e}")
 
@@ -991,7 +1302,7 @@ with st.sidebar:
             with st.spinner("오늘치 데이터를 추가하여 모델을 업데이트합니다..."):
                 success, msg = train_global_model(krx_list, limit=100, mode="update")
                 if success:
-                    st.success(msg); st.cache_resource.clear(); time.sleep(2); st.rerun()
+                    st.success(msg); st.cache_resource.clear(); st.cache_data.clear(); time.sleep(2); st.rerun()
                 else: st.error(msg)
 
         st.markdown("---")
@@ -1005,102 +1316,144 @@ with st.sidebar:
 
     min_m = st.number_input("최소 시총(억)", value=3000) * 100000000
 
-if 'last_scan_time' not in st.session_state:
-    st.session_state['last_scan_time'] = datetime.datetime.min
+    if 'last_scan_time' not in st.session_state:
+        st.session_state['last_scan_time'] = datetime.datetime.min
 
-should_run_auto = False
-if auto_scan_on:
-    if is_market_open: 
-        elapsed = get_now_kst().replace(tzinfo=None) - st.session_state['last_scan_time'].replace(tzinfo=None)
-        if elapsed.total_seconds() > (scan_interval_min * 60): 
-            should_run_auto = True
-            st.session_state['last_scan_time'] = get_now_kst().replace(tzinfo=None)
-        else:
-            time.sleep(1)
-            st.rerun()
-    else: st.sidebar.warning("🌙 장 마감: 자동 스캔 대기 중")
+    should_run_auto = False
+    if auto_scan_on:
+        if is_market_open: 
+            elapsed = get_now_kst().replace(tzinfo=None) - st.session_state['last_scan_time'].replace(tzinfo=None)
+            if elapsed.total_seconds() > (scan_interval_min * 60): 
+                should_run_auto = True
+                st.session_state['last_scan_time'] = get_now_kst().replace(tzinfo=None)
+            else:
+                time.sleep(1)
+                st.rerun()
+        else: st.sidebar.warning("🌙 장 마감: 자동 스캔 대기 중")
 
-def generate_closing_report():
-    report = []
-    now = get_now_kst()
-    report.append(f"<b>🌅 [AI Master] {now.strftime('%Y-%m-%d')} 마감 리포트</b>\n")
-    try:
-        us_indices = {'나스닥': '^IXIC', 'S&P500': '^GSPC'}
-        report.append("<b>[🌎 글로벌 마감]</b>")
-        for name, ticker in us_indices.items():
-            idx_data = yf.download(ticker, period='2d', progress=False, threads=False) 
-            if not idx_data.empty and len(idx_data) >= 2:
-                if isinstance(idx_data.columns, pd.MultiIndex): idx_data.columns = idx_data.columns.get_level_values(0)
-                cp_idx = idx_data['Close'].iloc[-1]; pp_idx = idx_data['Close'].iloc[-2]
-                chg = (cp_idx - pp_idx) / pp_idx * 100
-                symbol = "🔺" if chg > 0 else "🔻"
-                report.append(f"{symbol} {name}: {cp_idx:,.2f} ({chg:+.2f}%)")
-        report.append("")
-    except: pass
+    def generate_closing_report():
+        report = []
+        now = get_now_kst()
+        report.append(f"<b>🌅 [AI Master] {now.strftime('%Y-%m-%d')} 마감 리포트</b>\n")
+        try:
+            us_indices = {'나스닥': '^IXIC', 'S&P500': '^GSPC'}
+            report.append("<b>[🌎 글로벌 마감]</b>")
+            for name, ticker in us_indices.items():
+                idx_data = yf.download(ticker, period='2d', progress=False, threads=False) 
+                if not idx_data.empty and len(idx_data) >= 2:
+                    if isinstance(idx_data.columns, pd.MultiIndex): idx_data.columns = idx_data.columns.get_level_values(0)
+                    cp_idx = idx_data['Close'].iloc[-1]; pp_idx = idx_data['Close'].iloc[-2]
+                    chg = (cp_idx - pp_idx) / pp_idx * 100
+                    symbol = "🔺" if chg > 0 else "🔻"
+                    report.append(f"{symbol} {name}: {cp_idx:,.2f} ({chg:+.2f}%)")
+            report.append("")
+        except: pass
 
-    pf_df = get_portfolio_gsheets()
-    if not pf_df.empty:
-        report.append("<b>[💼 내 포트폴리오(시트): 물타기 추천]</b>")
-        watering_needed = False
-        for _, r in pf_df.iterrows():
-            d, _ = get_data_safe(r['Code'], days=300)
-            if d is not None:
-                df_ind = get_all_indicators(d)
-                if df_ind is not None:
-                    cp = df_ind['Close'].iloc[-1]; buy_price = float(r['Buy_Price'])
-                    _, _, mkt_stat = get_ai_condition()
-                    s = get_darwin_strategy(df_ind, buy_price, code=r['Code'], use_mtf=True, min_inv=invest_min, max_inv=invest_max, market_status=mkt_stat)
-                    if s and cp < buy_price and s['score'] >= 70 and s['ai'] >= 60:
-                        watering_needed = True
-                        loss_pct = (cp - buy_price) / buy_price * 100
-                        prefix = f"💧 <b>[물타기적합]</b> (손실 {loss_pct:.2f}%) "
-                        report.append(format_3split_msg(r['Name'], s, prefix=prefix))
-        if not watering_needed: report.append("📌 현재 물타기 권장 종목 없음 (보수적 기준 미달)\n")
-    
-    report.append("<b>[⭐ 명일 주력 추천 (교차검증)]</b>")
-    report.append("<i>대상: KOSPI200/KOSDAQ150 중 AI+MTF+수급+Fibo 우량주</i>\n")
-    try:
-        k200 = fdr.StockListing('KOSPI 200')['Code'].tolist()
-        kd150 = fdr.StockListing('KOSDAQ 150')['Code'].tolist()
-        target_codes = list(set(k200 + kd150))
-    except: target_codes = krx_list.head(200)['Code'].tolist()
-
-    found_count = 0
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        fut_map = {executor.submit(get_data_safe, c, 300): c for c in target_codes}
-        for fut in as_completed(fut_map):
-            try:
-                d_raw, _ = fut.result()
-                if d_raw is not None:
-                    df_ind = get_all_indicators(d_raw)
+        pf_df = get_portfolio_gsheets()
+        if not pf_df.empty:
+            report.append("<b>[💼 내 포트폴리오(시트): 물타기 추천]</b>")
+            watering_needed = False
+            for _, r in pf_df.iterrows():
+                d, _ = get_data_safe(r['Code'], days=300)
+                if d is not None:
+                    df_ind = get_all_indicators(d)
                     if df_ind is not None:
+                        cp = df_ind['Close'].iloc[-1]; buy_price = float(r['Buy_Price'])
                         _, _, mkt_stat = get_ai_condition()
-                        s_res = get_darwin_strategy(df_ind, code=fut_map[fut], use_mtf=True, min_inv=invest_min, max_inv=invest_max, market_status=mkt_stat) 
-                        if s_res and s_res['score'] >= 70 and s_res['ai'] >= 65:
-                            name = krx_list[krx_list['Code'] == fut_map[fut]]['Name'].values[0]
-                            report.append(format_3split_msg(name, s_res, prefix="🔥"))
-                            found_count += 1
-                            if found_count >= 5: break
-            except: continue
-    if found_count == 0: report.append("🚩 명일 강력 추천 종목 없음 (관망 권장)")
-    return "\n".join(report)
+                        s = get_darwin_strategy(df_ind, buy_price, code=r['Code'], use_mtf=True, min_inv=invest_min, max_inv=invest_max, market_status=mkt_stat)
+                        if s and cp < buy_price and s['score'] >= 70 and s['ai'] >= 60:
+                            watering_needed = True
+                            loss_pct = (cp - buy_price) / buy_price * 100
+                            prefix = f"💧 <b>[물타기적합]</b> (손실 {loss_pct:.2f}%) "
+                            report.append(format_3split_msg(r['Name'], s, prefix=prefix))
+            if not watering_needed: report.append("📌 현재 물타기 권장 종목 없음 (보수적 기준 미달)\n")
+        
+        report.append("<b>[⭐ 명일 주력 추천 (교차검증)]</b>")
+        report.append("<i>대상: KOSPI200/KOSDAQ150 중 AI+MTF+수급+Fibo 우량주</i>\n")
+        try:
+            k200 = fdr.StockListing('KOSPI 200')['Code'].tolist()
+            kd150 = fdr.StockListing('KOSDAQ 150')['Code'].tolist()
+            target_codes = list(set(k200 + kd150))
+        except: target_codes = krx_list.head(200)['Code'].tolist()
 
-if 'sent_report_date' not in st.session_state:
-    st.session_state['sent_report_date'] = None
+        found_count = 0
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            fut_map = {executor.submit(get_data_safe, c, 300): c for c in target_codes}
+            for fut in as_completed(fut_map):
+                try:
+                    d_raw, _ = fut.result()
+                    if d_raw is not None:
+                        if len(d_raw) < 60: continue
+                        cur_amt = (d_raw['Close'].iloc[-1] * d_raw['Volume'].iloc[-1])
+                        if cur_amt < 1000000000: continue
 
-cur_date = now.strftime("%Y-%m-%d")
-target_dt = now.replace(hour=report_time.hour, minute=report_time.minute, second=0, microsecond=0)
-valid_window = timedelta(minutes=30)
+                        df_ind = get_all_indicators(d_raw)
+                        if df_ind is not None:
+                            _, _, mkt_stat = get_ai_condition()
+                            s_res = get_darwin_strategy(df_ind, code=fut_map[fut], use_mtf=True, min_inv=invest_min, max_inv=invest_max, market_status=mkt_stat) 
+                            if s_res and s_res['score'] >= 70 and s_res['ai'] >= 65:
+                                name = krx_list[krx_list['Code'] == fut_map[fut]]['Name'].values[0]
+                                report.append(format_3split_msg(name, s_res, prefix="🔥"))
+                                found_count += 1
+                                if found_count >= 5: break
+                except: continue
+        if found_count == 0: report.append("🚩 명일 강력 추천 종목 없음 (관망 권장)")
+        return "\n".join(report)
 
-if auto_report and (target_dt <= now <= target_dt + valid_window):
-    if st.session_state['sent_report_date'] != cur_date:
-        if tg_token and tg_id:
-            with st.spinner("📧 마감 리포트 자동 발송 중..."):
-                rpt = generate_closing_report()
-                send_telegram_msg(tg_token, tg_id, rpt)
-                st.session_state['sent_report_date'] = cur_date 
-                st.toast(f"{report_time.strftime('%H:%M')} 리포트 발송 완료!", icon="✅")
+    if 'sent_report_date' not in st.session_state:
+        st.session_state['sent_report_date'] = None
 
+    cur_date = now.strftime("%Y-%m-%d")
+    target_dt = now.replace(hour=report_time.hour, minute=report_time.minute, second=0, microsecond=0)
+    valid_window = timedelta(minutes=30)
+
+    if auto_report and (target_dt <= now <= target_dt + valid_window):
+        if st.session_state['sent_report_date'] != cur_date:
+            if tg_token and tg_id:
+                with st.spinner("📧 마감 리포트 자동 발송 중..."):
+                    rpt = generate_closing_report()
+                    send_telegram_msg(tg_token, tg_id, rpt)
+                    st.session_state['sent_report_date'] = cur_date 
+                    st.toast(f"{report_time.strftime('%H:%M')} 리포트 발송 완료!", icon="✅")
+
+    st.markdown("---")
+    if st.button("📧 마감 리포트(명일전략) 생성"):
+        with st.spinner("데이터 분석 및 리포트 작성 중..."):
+            rpt_text = generate_closing_report()
+            st.session_state['generated_report'] = rpt_text 
+            if tg_token and tg_id: 
+                send_telegram_msg(tg_token, tg_id, rpt_text)
+                st.toast("텔레그램 발송 완료!", icon="✈️")
+            else: st.toast("리포트 생성 완료", icon="⚠️")
+
+    # 🧮 목표가 도달 확률 계산기
+    st.markdown("---")
+    with st.expander("🧮 목표가 도달 확률 계산기", expanded=True):
+        st.caption("AI와 변동성(ATR) 기반 예측")
+        calc_code = st.text_input("종목코드", value="035720") 
+        calc_target = st.number_input("희망 목표가", value=80000, step=1000)
+        calc_days = st.selectbox("기간 설정", [60, 120, 240], index=1, format_func=lambda x: f"{x}거래일 (약 {x//20}개월)")
+        
+        if st.button("🎲 확률 계산 실행"):
+            with st.spinner("AI가 시뮬레이션 중..."):
+                d_cal, _ = get_data_safe(calc_code, 300)
+                if d_cal is not None:
+                    df_cal = get_all_indicators(d_cal)
+                    if df_cal is not None:
+                        curr_p = df_cal['Close'].iloc[-1]
+                        atr = df_cal['ATR'].iloc[-1]
+                        ai_s = get_ai_score_fast(df_cal) 
+                        prob = calc_reach_prob(curr_p, calc_target, atr, ai_s, base_days=calc_days)
+                        st.write(f"**현재가:** {int(curr_p):,}원")
+                        st.write(f"**AI 점수:** {ai_s}점")
+                        dist_pct = (calc_target - curr_p) / curr_p * 100
+                        if prob > 50: st.success(f"🎉 도달 확률: **{prob}%** (매우 높음)")
+                        elif prob > 20: st.warning(f"⚠️ 도달 확률: **{prob}%** (도전적)")
+                        else: st.error(f"📉 도달 확률: **{prob}%** (희박함)")
+                        st.caption(f"💡 {dist_pct:.1f}% 상승은 현재 변동성으로 쉽지 않습니다.")
+                else: st.error("데이터 로딩 실패")
+
+# --- Tabs Implementation ---
 tabs = st.tabs(["📊 대시보드", "🔍 MTF 스캐너", "🧬 백테스트", "💼 분석", "➕ 관리(GSheets)", "🔄 회복 시뮬레이션", "📈 AI 성장 일기", "💾 동기화"])
 
 with tabs[0]: # 대시보드
@@ -1117,12 +1470,14 @@ with tabs[0]: # 대시보드
         try:
             m_data = joblib.load(MODEL_FILE)
             if 'feature_importance' in m_data:
-                with st.expander("🧠 AI 모델 브리핑 (Brain Scan)", expanded=True):
+                with st.expander("🧠 AI 모델 브리핑 (XGB + RF + LSTM-L2)", expanded=True):
                     ic1, ic2, ic3 = st.columns(3)
                     acc_score = m_data.get('oob_score', 0) * 100
-                    ic1.metric("AI 예측 정확도 (OOB)", f"{acc_score:.1f}%")
-                    ic2.metric("학습 데이터 샘플", f"{m_data.get('sample_size', 0)}개 종목")
-                    ic3.metric("최근 학습일", m_data.get('date', '-'))
+                    ic1.metric("RF OOB 정확도", f"{acc_score:.1f}%")
+                    ic2.metric("학습 샘플 수", f"{m_data.get('sample_size', 0)}개")
+                    
+                    lstm_stat = "✅ 적용됨" if m_data.get('lstm_status') else "❌ 미적용"
+                    ic3.metric("LSTM 엔진 상태", lstm_stat)
                     
                     fi_df = pd.DataFrame({
                         'Feature': m_data['feature_names'],
@@ -1180,7 +1535,12 @@ with tabs[1]: # 스캐너
                 try:
                     d_raw, err = f.result()
                     status_txt.markdown(f"📡 **{name}** 분석 중... ({i+1}/{target_count})")
-                    if d_raw is not None:
+                    
+                    if d_raw is not None and not d_raw.empty:
+                        # [Improvement 1] 스캐너 컷오프 적용: 거래대금 20억 미만 즉시 Skip
+                        cur_amt = (d_raw['Close'].iloc[-1] * d_raw['Volume'].iloc[-1])
+                        if cur_amt < 2000000000: continue
+
                         res = get_all_indicators(d_raw)
                         if res is not None:
                             sec_s = sec_map.get(sector, 0)
@@ -1201,9 +1561,11 @@ with tabs[1]: # 스캐너
         
         history_df = get_scan_history()
         already_sent_today = []
-        if not history_df.empty:
+        if history_df is not None and not history_df.empty:
             today_str = get_now_kst().strftime('%Y-%m-%d')
-            already_sent_today = history_df[history_df['Date'] == today_str]['Code'].tolist()
+            if 'Date' in history_df.columns:
+                already_sent_today = history_df[history_df['Date'] == today_str]['Code'].tolist()
+        
         large_cap = []; mid_cap = []; small_cap = []
         for item in found:
             m = item['marcap']
@@ -1429,11 +1791,12 @@ with tabs[3]: # 분석
 
                         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3], subplot_titles=("가격 및 이동평균선", "스토캐스틱"))
                         fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Candle', increasing_line_color='#ef5350', decreasing_line_color='#2962ff'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['MA5'], line=dict(color='black', width=1), name='5일선'), row=1, col=1)
+                        # Ichimoku Cloud (Span A, B fill)
+                        fig.add_trace(go.Scatter(x=df.index, y=df['Ichi_SpanA'], line=dict(color='rgba(0,0,0,0)'), showlegend=False), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=df['Ichi_SpanB'], fill='tonexty', fillcolor='rgba(135, 206, 235, 0.2)', line=dict(color='rgba(0,0,0,0)'), name='구름대'), row=1, col=1)
+
                         fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='blue', width=2), name='20일선'), row=1, col=1)
                         fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='green', width=1.5), name='60일선'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['MA120'], line=dict(color='orange', width=2), name='120일선'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['MA200'], line=dict(color='red', width=2, dash='dot'), name='200일선'), row=1, col=1)
                         fig.add_trace(go.Scatter(x=df.index, y=df['BB_Up'], line=dict(color='gray', width=1, dash='dot'), name='BB상단', showlegend=False), row=1, col=1)
                         fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lo'], line=dict(color='gray', width=1, dash='dot'), name='BB하단', showlegend=False), row=1, col=1)
                         fig.add_trace(go.Scatter(x=df.index, y=df['Stoch_5'], line=dict(color='#2962ff', width=1.5), name='Fast(5-3-3)'), row=2, col=1)
@@ -1473,7 +1836,7 @@ with tabs[4]: # 관리 (GSheets Manual Input)
         if st.button("선택 종목 삭제"): 
              st.info("구글 스프레드시트에서 직접 행을 삭제해주세요.")
 
-with tabs[5]: # Recovery & Rebalance Tab (Updated with Profit Awareness)
+with tabs[5]: # Recovery & Rebalance Tab
     st.subheader("🔄 원금 회복 & 포트폴리오 시뮬레이터")
     pf = get_portfolio_gsheets()
     if pf.empty: st.warning("⚠️ 포트폴리오가 비어있습니다. [관리] 탭에서 종목을 먼저 추가해주세요.")
@@ -1509,19 +1872,6 @@ with tabs[5]: # Recovery & Rebalance Tab (Updated with Profit Awareness)
                 if t_stats:
                     c4.metric("원금회복 필요수익", f"+{t_stats['req_return']:.2f}%")
                     st.markdown(f"""<div class="recovery-card">📊 <b>진단 결과:</b> 3개월(60영업일) 내 회복 확률: <span style="font-size:1.5em; color:#d32f2f; font-weight:bold;">{t_stats['prob_3m']:.1f}%</span></div>""", unsafe_allow_html=True)
-                    days = 60; dt = 1/252; paths = []; np.random.seed(42)
-                    for _ in range(20): 
-                        price = [total_eval]
-                        for _ in range(days):
-                            change = np.random.normal(0.05 * dt, port_volatility * np.sqrt(dt))
-                            price.append(price[-1] * (1 + change))
-                        paths.append(price)
-                    fig_mc = go.Figure()
-                    for p in paths: fig_mc.add_trace(go.Scatter(y=p, mode='lines', line=dict(width=1, color='rgba(0,150,136,0.3)'), showlegend=False))
-                    fig_mc.add_hline(y=total_buy, line_dash="dash", line_color="red", annotation_text="원금")
-                    fig_mc.update_layout(title="향후 3개월 시뮬레이션", height=300, template="plotly_white")
-                    st.plotly_chart(fig_mc, use_container_width=True)
-                else: st.success("🎉 수익 중! 시뮬레이션 불필요")
                 
                 st.markdown("---")
                 st.markdown("#### ⚖️ AI & 수익률 기반 리밸런싱 제안")
@@ -1535,88 +1885,140 @@ with tabs[5]: # Recovery & Rebalance Tab (Updated with Profit Awareness)
                         for rb in rebal_res[len(rebal_res)//2 + 1:]:
                             st.markdown(f"""<div class="rebal-card" style="border-left: 5px solid {rb['color']}"><b>{rb['name']}</b> (AI:{rb['score']}점 / {rb['profit']:.1f}%) → <span style="color:{rb['color']}; font-weight:bold;">{rb['action']}</span><br><span style="color:#555; font-size:0.85em;">{rb['reason']}</span></div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("#### 🔍 종목별 정밀 진단")
-        for _, row in pf.iterrows():
-            d, _ = get_data_safe(row['Code'], 200)
-            if d is not None:
-                daily_ret = d['Close'].pct_change().dropna(); vol = daily_ret.std() * np.sqrt(252)
-                rec_stats = calc_recovery_math(row['Buy_Price'], d['Close'].iloc[-1], vol)
-                if rec_stats:
-                    with st.expander(f"📉 {row['Name']} (손실 {rec_stats['loss_pct']:.1f}%) 상세 분석", expanded=False):
-                        c1, c2 = st.columns(2)
-                        c1.write(f"**현재 상태**"); c1.write(f"- 필요 상승률: **+{rec_stats['req_return']:.2f}%**"); c1.write(f"- 3개월 회복 확률: **{rec_stats['prob_3m']:.1f}%**")
-                        c2.write(f"**💧 1:1 물타기 시뮬레이션**")
-                        new_avg = (row['Buy_Price'] + d['Close'].iloc[-1]) / 2
-                        rec_stats_new = calc_recovery_math(new_avg, d['Close'].iloc[-1], vol)
-                        if rec_stats_new:
-                            c2.write(f"- 예상 평단가: {int(new_avg):,}원"); c2.write(f"- 필요 상승률: **+{rec_stats_new['req_return']:.2f}%**"); c2.write(f"- 회복 확률: **{rec_stats_new['prob_3m']:.1f}%**")
-
 with tabs[6]:
-    col_h, col_b = st.columns([3, 1])
-    with col_h: st.subheader("📈 AI 성장 일기 (Learning Curve)")
-    with col_b:
-        if st.button("🗑️ 기록 전액 삭제", type="primary", use_container_width=True):
+    st.subheader("📈 AI 성장 일기 (Portfolio Performance)")
+    
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        if st.button("🗑️ 기록 초기화", type="primary", use_container_width=True, key="del_final_v8158"):
             try:
                 conn = st.connection("gsheets", type=GSheetsConnection)
-                empty_df = pd.DataFrame(columns=['Date', 'Code', 'Name', 'Entry_Price', 'Target_Price', 'Stop_Price', 'Strategy'])
+                empty_df = pd.DataFrame(columns=['Date', 'Code', 'Name', 'Entry_Price', 'Target_Price', 'Stop_Price', 'Strategy', 'Buys_Info', 'Sells_Info'])
                 conn.update(worksheet="history", data=empty_df)
-                st.toast("기록이 삭제되었습니다!", icon="✨"); time.sleep(1.5); st.rerun()
-            except Exception as e: st.error(f"초기화 실패: {e}")
+                st.cache_data.clear()
+                st.toast("초기화 완료!", icon="✨"); time.sleep(1); st.rerun()
+            except: pass
 
     df_history = get_scan_history()
-    if not df_history.empty:
-        tracked_data = []
-        with st.spinner("실시간 시세 동기화 및 상세 추적 중..."):
-            for _, row in df_history.iterrows():
-                try:
-                    code = str(row['Code']).zfill(6)
-                    d_latest, _ = get_data_safe(code, days=7)
-                    if d_latest is not None and not d_latest.empty:
-                        curr_p = float(d_latest['Close'].values[-1])
-                        buys = json.loads(row.get('Buys_Info', '[]')); sells = json.loads(row.get('Sells_Info', '[]'))
-                        entry_p = float(row['Entry_Price'])
-                        if not buys: buys = [entry_p] 
-                        if not sells: sells = [float(row['Target_Price'])]
-                        target_date = pd.to_datetime(row['Date']).date()
-                        mask = d_latest.index.date >= target_date; valid_data = d_latest[mask]
-                        buy_step = 0; sell_step = 0; status_label = "⏳미체결"; profit = 0.0
-                        if not valid_data.empty:
-                            min_low = valid_data['Low'].min(); max_high = valid_data['High'].max()
-                            for i, bp in enumerate(buys):
-                                if min_low <= bp * 1.005: buy_step = i + 1
-                            if buy_step > 0:
-                                for i, sp in enumerate(sells):
-                                    if max_high >= sp: sell_step = i + 1
-                                if sell_step > 0:
-                                    status_label = f"🔴{sell_step}차달성"; profit = (sells[sell_step-1] - entry_p) / entry_p * 100 
-                                else:
-                                    status_label = f"🔵{buy_step}차매수"; profit = (curr_p - entry_p) / entry_p * 100 
-                        tracked_data.append({"포착일": row['Date'], "종목명": row['Name'], "상태": status_label, "매수대기": f"{int(entry_p):,}원", "현재가": f"{int(curr_p):,}원", "수익률": f"{profit:+.2f}%", "전략": row['Strategy'], "raw_profit": profit})
-                except: continue
 
-        if tracked_data:
-            res_df = pd.DataFrame(tracked_data)
-            filled_mask = res_df['상태'] != "⏳미체결"
-            filled_df = res_df[filled_mask]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("총 포착 / 체결", f"{len(res_df)}개 / {len(filled_df)}개")
-            if not filled_df.empty:
-                avg_profit = filled_df['raw_profit'].mean()
-                win_cnt = len(filled_df[filled_df['raw_profit'] > 0])
-                win_rate = (win_cnt / len(filled_df) * 100)
-                c2.metric("실현 평균 수익률", f"{avg_profit:+.2f}%")
-                c3.metric("승률 (체결 기준)", f"{win_rate:.1f}%", f"{win_cnt}승 / {len(filled_df)}전")
-                filled_df['Date'] = pd.to_datetime(filled_df['포착일'])
-                filled_df = filled_df.sort_values('Date')
-                filled_df['Cumulative_Profit'] = filled_df['raw_profit'].cumsum()
-                fig = px.line(filled_df, x='Date', y='Cumulative_Profit', title="💰 AI 누적 수익률 성장 곡선 (J-Curve)", markers=True, template="plotly_white")
-                fig.update_traces(line_color='#00897b', line_width=3)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                c2.metric("실현 평균 수익률", "0.00%"); c3.metric("승률", "0.0%")
-            st.dataframe(res_df.sort_values("raw_profit", ascending=False).drop(columns=['raw_profit']), use_container_width=True)
-    else: st.info("기록 없음")
+    # [V81.58 Fix] Check for None explicitly before accessing .empty
+    if df_history is not None and not df_history.empty:
+        if 'Date' in df_history.columns:
+            df_history = df_history.sort_values('Date', ascending=False)
+
+        st.markdown("### 📊 Overall Statistics")
+        total_cnt = len(df_history)
+        try:
+            avg_plan_profit = ((pd.to_numeric(df_history['Target_Price'], errors='coerce') - pd.to_numeric(df_history['Entry_Price'], errors='coerce')) / pd.to_numeric(df_history['Entry_Price'], errors='coerce') * 100).mean()
+        except: avg_plan_profit = 0.0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("📋 전체 포착", f"{total_cnt}개")
+        m2.metric("🎯 평균 목표수익", f"{avg_plan_profit:.1f}%")
+        
+        p_filled = m3.empty()
+        p_win = m4.empty()
+        p_filled.metric("🛒 실제 진입", "계산중...")
+        p_win.metric("💯 누적 승률", "계산중...")
+        
+        st.divider()
+
+        filled_cnt = 0 
+        win_cnt = 0      
+
+        st.caption(f"👇 총 {total_cnt}개 종목의 최신 시세와 컨센서스를 분석합니다...")
+        progress_bar = st.progress(0)
+
+        for i, (idx, row) in enumerate(df_history.iterrows()):
+            try:
+                progress_bar.progress((i + 1) / total_cnt)
+                code = str(row['Code']).zfill(6)
+                entry_p = float(row['Entry_Price'])
+                target_p = float(row['Target_Price'])
+
+                try:
+                    buys = json.loads(row.get('Buys_Info', '[]'))
+                    sells = json.loads(row.get('Sells_Info', '[]'))
+                except: buys, sells = [], []
+                
+                if not buys: buys = [entry_p]
+                if not sells: sells = [target_p]
+
+                curr_p, day_low, day_high = entry_p, 0, 0
+                try:
+                    df_now = fdr.DataReader(code, datetime.datetime.now() - timedelta(days=5))
+                    if not df_now.empty:
+                        curr_p = float(df_now['Close'].iloc[-1])
+                        day_low = float(df_now['Low'].min())
+                        day_high = float(df_now['High'].max())
+                except: pass
+
+                con_price, con_opinion = 0, 0.0
+                try:
+                    con_price, con_opinion = get_consensus_data(code)
+                except: pass
+
+                buy_step = 0
+                for bp in buys:
+                    if day_low <= float(bp) * 1.01: buy_step += 1
+                
+                sell_step = 0
+                if buy_step > 0:
+                    filled_cnt += 1 
+                    for sp in sells:
+                        if day_high >= float(sp): sell_step += 1
+                    if sell_step > 0: win_cnt += 1 
+
+                status_emoji = "⏳"
+                status_msg = "대기"
+                profit_str = ""
+                
+                if buy_step > 0:
+                    profit = (curr_p - float(buys[0])) / float(buys[0]) * 100
+                    profit_str = f"({profit:+.2f}%)"
+                    if sell_step > 0:
+                        status_emoji = "🎉"; status_msg = f"{sell_step}차 익절"
+                    else:
+                        status_emoji = "🔴" if profit > 0 else "🔵"
+                        status_msg = f"{buy_step}차 보유"
+                else:
+                    gap = (float(buys[0]) - curr_p) / curr_p * 100
+                    profit_str = f"(괴리 {gap:.1f}%)"
+                    status_msg = "미체결"
+
+                label = f"{status_emoji} **{row['Name']}** │ {status_msg} │ 현재: {curr_p:,.0f}원 {profit_str}"
+                
+                with st.expander(label):
+                    if con_price > 0:
+                        up_pot = (con_price - curr_p) / curr_p * 100
+                        con_msg = f"🎯 **증권사 컨센서스**: 목표가 **{con_price:,}원** (괴리율 {up_pot:+.1f}%) │ 투자의견: {con_opinion}/5.0"
+                        if up_pot > 0: st.info(con_msg)
+                        else: st.warning(con_msg)
+                    else:
+                        st.caption("📉 증권사 컨센서스(목표가) 데이터가 없습니다.")
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("##### 🔵 매수 단계 (Buying)")
+                        for idx_b, p in enumerate(buys):
+                            chk = "✅ **체결**" if day_low <= float(p)*1.01 else "⏳"
+                            st.write(f"- {idx_b+1}차: {float(p):,.0f}원 {chk}")
+                    with c2:
+                        st.markdown("##### 🔴 매도 단계 (Selling)")
+                        for idx_s, p in enumerate(sells):
+                            chk = "🎉 **달성**" if (buy_step > 0 and day_high >= float(p)) else "🎯"
+                            st.write(f"- {idx_s+1}차: {float(p):,.0f}원 {chk}")
+                    
+                    st.caption(f"Captured Strategy: {row['Strategy']}")
+
+            except Exception as e: continue
+        
+        progress_bar.empty()
+        win_rate = (win_cnt / filled_cnt * 100) if filled_cnt > 0 else 0.0
+        p_filled.metric("🛒 실제 진입", f"{filled_cnt}개")
+        p_win.metric("💯 누적 승률", f"{win_rate:.1f}%")
+
+    else: st.info("📭 기록이 없습니다.")
 
 with tabs[7]:
     st.subheader("💾 AI 모델 동기화")
@@ -1635,20 +2037,11 @@ with tabs[7]:
                 with open(MODEL_FILE, "wb") as f: f.write(uploaded_file.getbuffer())
                 st.success("✅ 적용 완료 (새로고침 필요)"); time.sleep(2); st.rerun()
 
-with st.sidebar:
-    st.markdown("---")
-    if st.button("📧 마감 리포트(명일전략) 생성"):
-        with st.spinner("데이터 분석 및 리포트 작성 중..."):
-            rpt_text = generate_closing_report()
-            st.session_state['generated_report'] = rpt_text 
-            if tg_token and tg_id: 
-                send_telegram_msg(tg_token, tg_id, rpt_text)
-                st.toast("텔레그램 발송 완료!", icon="✈️")
-            else: st.toast("리포트 생성 완료", icon="⚠️")
-
 if 'generated_report' in st.session_state and st.session_state['generated_report']:
     st.markdown("---"); st.subheader("📝 생성된 마감 리포트")
     with st.expander("▼ 리포트 내용 확인하기 (클릭)", expanded=True):
         st.markdown(st.session_state['generated_report'], unsafe_allow_html=True)
         if st.button("닫기 (화면 지우기)"): del st.session_state['generated_report']; st.rerun()
+
+
 

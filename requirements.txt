@@ -1,0 +1,16 @@
+streamlit
+pandas
+numpy
+finance-datareader>=0.9.90
+yfinance>=0.2.40
+plotly
+requests
+scikit-learn
+st-gsheets-connection
+lxml
+tensorflow-cpu
+pyupbit
+joblib
+scipy
+xgboost
+

@@ -3,7 +3,7 @@ import pandas as pd
 import FinanceDataReader as fdr
 import yfinance as yf
 import datetime, time, requests, os, json, gc
-import joblib 
+import joblib
 import traceback
 from datetime import timezone, timedelta
 import numpy as np
@@ -16,19 +16,20 @@ from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 from scipy.signal import find_peaks
 from scipy.stats import norm
-from bs4 import BeautifulSoup 
+from bs4 import BeautifulSoup
 
 # [V81.58 Update] 딥러닝/규제 라이브러리
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-from tensorflow.keras.regularizers import l2 
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras import backend as K  # 메모리 정리를 위해 추가
 from sklearn.preprocessing import MinMaxScaler
 
 # ==========================================
 # ⚙️ 1. 시스템 설정 및 초기화
 # ==========================================
-MODEL_FILE = "ai_ensemble_model.pkl" 
+MODEL_FILE = "ai_ensemble_model.pkl"
 LSTM_MODEL_FILE = "ai_lstm_model.h5"
 SCALER_FILE = "ai_lstm_scaler.pkl"
 
@@ -37,7 +38,7 @@ def get_now_kst():
 
 def check_market_open():
     now = get_now_kst()
-    if now.weekday() >= 5: return False 
+    if now.weekday() >= 5: return False
     start_time = datetime.time(9, 0)
     end_time = datetime.time(15, 30)
     return start_time <= now.time() <= end_time
@@ -76,7 +77,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 🧠 2. LSTM 엔진 (V81.58 수정 완료: L2 규제 적용)
+# 🧠 2. LSTM 엔진 (V81.58 수정 완료: 최적화 적용)
 # ==========================================
 class LSTMEngine:
     def __init__(self, lookback=20):
@@ -84,44 +85,35 @@ class LSTMEngine:
         self.model = None
         self.scaler = None
 
-    # 🔹 헬퍼 함수: 지연 로딩 (필요할 때만 TensorFlow 로드)
     def _import_tf(self):
         try:
             import tensorflow as tf
             from tensorflow.keras.models import Sequential, load_model
             from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-            
-            # [V81.58 Fix] l2 규제 모듈 명시적 임포트
-            from tensorflow.keras.regularizers import l2 
+            from tensorflow.keras.regularizers import l2
+            from tensorflow.keras import backend as K
             from sklearn.preprocessing import MinMaxScaler
-            
-            # 반환 값 순서: tf, Seq, load, LSTM, Dense, Drop, Input, l2, MMS
-            return tf, Sequential, load_model, LSTM, Dense, Dropout, Input, l2, MinMaxScaler
+            return tf, Sequential, load_model, LSTM, Dense, Dropout, Input, l2, K, MinMaxScaler
         except ImportError:
-            # 반환 개수(9개)를 맞춰서 None 리턴
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None
 
     def create_model(self, input_shape):
-        # [V81.58 Fix] l2 변수 받아오기
-        tf, Sequential, _, LSTM, Dense, Dropout, Input, l2, _ = self._import_tf()
-        
+        tf, Sequential, _, LSTM, Dense, Dropout, Input, l2, _, _ = self._import_tf()
         if not tf: return None
         
-        # 모델 구조 정의
+        # [Optimized] 모델 구조 개선
         model = Sequential()
         model.add(Input(shape=input_shape))
-        
-        # [V81.58 Fix] LSTM 층에 kernel_regularizer=l2(0.001) 적용
-        model.add(LSTM(32, return_sequences=False, kernel_regularizer=l2(0.001))) 
-        model.add(Dropout(0.2))
+        # 유닛수 32->64 상향, L2규제 0.01로 강화 (노이즈 강건성 확보)
+        model.add(LSTM(64, return_sequences=False, kernel_regularizer=l2(0.01)))
+        model.add(Dropout(0.3)) # 드롭아웃 비율 상향
         model.add(Dense(1, activation='sigmoid'))
         
         model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
         return model
 
     def prepare_data(self, df, training=False):
-        # MinMaxScaler 받아오기 (마지막 순서)
-        _, _, _, _, _, _, _, _, MinMaxScaler = self._import_tf()
+        _, _, _, _, _, _, _, _, _, MinMaxScaler = self._import_tf()
         
         features = ['Close', 'Volume', 'RSI', 'MACD', 'Stoch_20']
         if len(df) < self.lookback + 5: return None, None
@@ -153,6 +145,9 @@ class LSTMEngine:
             return np.array([last_sequence]), None
 
     def train_and_save(self, df_list):
+        tf, _, _, _, _, _, _, _, K, _ = self._import_tf()
+        if K: K.clear_session() # [Optimized] 메모리 정리
+
         if len(df_list) > 10: df_list = df_list[:10] 
         
         all_X, all_y = [], []
@@ -168,7 +163,7 @@ class LSTMEngine:
         
         self.model = self.create_model((self.lookback, X_final.shape[2]))
         if self.model:
-            self.model.fit(X_final, y_final, epochs=3, batch_size=16, verbose=0)
+            self.model.fit(X_final, y_final, epochs=5, batch_size=16, verbose=0) # Epoch 소폭 상향
             self.model.save(LSTM_MODEL_FILE)
             joblib.dump(self.scaler, SCALER_FILE)
             return True, f"LSTM 경량 학습 완료 ({len(X_final)}샘플)"
@@ -176,8 +171,8 @@ class LSTMEngine:
 
     def predict_score(self, df):
         try:
-            # 예측 시에는 load_model만 필요하지만 순서 맞춤
-            _, _, load_model, _, _, _, _, _, _ = self._import_tf()
+            _, _, load_model, _, _, _, _, _, K, _ = self._import_tf()
+            if K: K.clear_session() # [Optimized] 예측 전 메모리 정리
             
             if self.model is None:
                 if os.path.exists(LSTM_MODEL_FILE): self.model = load_model(LSTM_MODEL_FILE)
@@ -190,10 +185,9 @@ class LSTMEngine:
             return int(prob * 100)
         except: return 50
 
-# 엔진 초기화 (이 줄도 꼭 있어야 합니다)
 lstm_engine = LSTMEngine()
 
-# --- [KIS API Client] (재시도 로직 강화) ---
+# --- [KIS API Client] ---
 class KIS_Data_Client:
     def __init__(self, app_key, app_secret, mock=False):
         self.app_key = app_key
@@ -455,13 +449,12 @@ def get_sector_performance_map(df_krx):
     except Exception as e: print(f"Sector Analysis Error: {e}")
     return sector_map
 
-# [V81.58 Fix] Decorator: Return empty DataFrame instead of None on failure
 def retry_gsheets(func):
     def wrapper(*args, **kwargs):
         for i in range(3):
             try: return func(*args, **kwargs)
             except: time.sleep(1)
-        return pd.DataFrame() # Return empty DF to prevent NoneType error
+        return pd.DataFrame() 
     return wrapper
 
 @retry_gsheets
@@ -519,9 +512,7 @@ def get_scan_history():
         return df
     return pd.DataFrame(columns=['Date', 'Code', 'Name', 'Entry_Price', 'Target_Price', 'Stop_Price', 'Strategy'])
 
-# 기존 analyze_market_condition 함수를 아래 코드로 덮어쓰세요.
 def analyze_market_condition(idx_code):
-    # 1. 기술적 분석 (기존 유지)
     df, _ = get_data_safe(idx_code, days=300)
     tech_score = 0
     adx = 0
@@ -541,13 +532,10 @@ def analyze_market_condition(idx_code):
         if curr > ma20.iloc[-1] and ma20.iloc[-1] > ma60.iloc[-1]: tech_score = -10 
         elif curr < ma20.iloc[-1] and ma20.iloc[-1] < ma60.iloc[-1]: tech_score = 15 
         
-    # 2. 매크로 분석 (에러 방지 강화)
     macro_score = 0
     macro_msg = []
     
-    # [수정됨] 야후 파이낸스 호출 안정화
     try:
-        # threads=False로 설정하여 차단 확률 낮춤
         usd_data = yf.download("KRW=X", period="5d", progress=False, threads=False)
         if not usd_data.empty:
             if isinstance(usd_data.columns, pd.MultiIndex): usd_data.columns = usd_data.columns.get_level_values(0)
@@ -561,7 +549,6 @@ def analyze_market_condition(idx_code):
             if us_bond > 4.5: macro_score += 5; macro_msg.append(f"금리부담({us_bond:.1f}%)")
             
     except Exception as e:
-        # 에러 발생 시 로그만 남기고 0점 처리 (앱 멈춤 방지)
         print(f"Macro Data Error: {e}") 
 
     final_score = tech_score + macro_score
@@ -622,7 +609,6 @@ def get_all_indicators(df):
     df.loc[mask_ob, 'OB_Bull'] = df['Open'].shift(1)
     df['OB_Support'] = df['OB_Bull'].replace(0, np.nan).ffill(limit=10).fillna(0)
     
-    # Stochastic Slow 로직 적용
     df['Stoch_5'] = calc_stoch(df, 5, 3, 3); df['Stoch_10'] = calc_stoch(df, 10, 6, 6); df['Stoch_20'] = calc_stoch(df, 20, 12, 12)
     
     tr1 = high - low; tr2 = (high - close.shift(1)).abs(); tr3 = (low - close.shift(1)).abs()
@@ -668,7 +654,6 @@ def get_benchmark_data(days=2600):
     kq11, _ = get_data_safe('KQ11', days)
     return ks11, kq11
 
-# [V81.58 Patch] 학습 로직 (Safe Guard: NoneType + 컷오프)
 def train_global_model(stock_list, limit=50, mode="update"):
     all_X = []; all_y = []
     collected_dfs = [] 
@@ -705,7 +690,6 @@ def train_global_model(stock_list, limit=50, mode="update"):
                 if df.empty: continue 
                 if len(df) <= 60: continue 
 
-                # 성능 최적화: 거래대금 컷오프
                 if 'Close' not in df.columns or 'Volume' not in df.columns: continue
                 avg_amt = (df['Close'] * df['Volume']).rolling(5).mean().iloc[-1]
                 if avg_amt < 1000000000: continue 
@@ -803,7 +787,6 @@ def get_ai_score_fast(df, market_code='KS11'):
     except Exception as e:
         return 50
 
-# [V80.74] Updated Rebalancing Logic
 def analyze_rebalancing_suggestion(pf_list):
     if not pf_list: return []
     suggestions = []
@@ -905,13 +888,20 @@ def analyze_mtf_comprehensive(code, daily_score):
             if cur15['Stoch_5'] < 20 and cur15['Stoch_5'] > prev15['Stoch_5']: mtf_bonus += 5; mtf_msg.append("15m타점")
     return mtf_bonus, mtf_msg
 
-def calc_recovery_math(buy_price, curr_price, volatility):
+# [V81.58 Fix] 동적 Drift 적용: 시장 상황에 따라 확률 보정
+def calc_recovery_math(buy_price, curr_price, volatility, market_trend="Neutral"):
     if buy_price <= 0 or curr_price <= 0: return None
     if curr_price >= buy_price: return None
     loss_amt = buy_price - curr_price
     loss_pct = (loss_amt / buy_price) * 100
     req_return = (loss_amt / curr_price) * 100
-    t = 60 / 252; dist = np.log(buy_price / curr_price); drift = 0.05 
+    
+    # [수정] 드리프트 동적 할당
+    drift = 0.05
+    if "하락" in market_trend or "Down" in market_trend: drift = -0.05
+    elif "횡보" in market_trend: drift = 0.0
+    
+    t = 60 / 252; dist = np.log(buy_price / curr_price)
     z = (dist - (drift - 0.5 * volatility**2) * t) / (volatility * np.sqrt(t))
     prob_3m = (1 - norm.cdf(z)) * 100
     return {"loss_pct": loss_pct, "req_return": req_return, "prob_3m": prob_3m, "volatility": volatility * 100}
@@ -955,7 +945,6 @@ def analyze_portfolio_action(score, ai_prob, loss_pct, rsi):
         elif loss_pct > 3: action_txt = "💰익절 권장"; action_col = "#fbc02d"; tag = "Profit"
     return action_txt, action_col, tag
 
-# [V81.10 Update] 이안 트레이더 패치
 def get_darwin_strategy(df, buy_price=0, code=None, use_mtf=False, min_inv=3000000, max_inv=5000000, market_status="Neutral", sec_score=0):
     if df is None or len(df) < 100: return None
     
@@ -1537,7 +1526,7 @@ with tabs[1]: # 스캐너
                     status_txt.markdown(f"📡 **{name}** 분석 중... ({i+1}/{target_count})")
                     
                     if d_raw is not None and not d_raw.empty:
-                        # [Improvement 1] 스캐너 컷오프 적용: 거래대금 20억 미만 즉시 Skip
+                        # [Optimized] 스캐너 컷오프: 거래대금 20억 미만 즉시 Skip
                         cur_amt = (d_raw['Close'].iloc[-1] * d_raw['Volume'].iloc[-1])
                         if cur_amt < 2000000000: continue
 
@@ -1743,305 +1732,4 @@ with tabs[3]: # 분석
 <div style="display:flex; justify-content:space-between; align-items:center;">
 <div>
 <h2 style="margin:0;">{target_name} {style_badge} {mode_badge} {alpha_badge} {break_tag}</h2>
-<p style="font-size:1.1em; color:{s['status']['color']}; font-weight:bold; margin-top:5px;">
-{s['status']['msg']} <span style="font-size:0.8em; color:#666;">(AI확률: {s['ai']}%)</span>
-</p>
-</div>
-<div style="text-align:right;">
-<h2 style="color:#333; margin:0;">{df['Close'].iloc[-1]:,}원</h2>
-<span class="pro-tag">MVWAP: {int(s['mvwap']):,}</span><br>
-<span style="font-size:0.9em; background:#e3f2fd; padding:3px 6px; border-radius:4px; font-weight:bold; color:#1565c0;">💰 {int(s['allocation']/10000)}만원</span>
-</div>
-</div>
-<div style="margin:10px 0;">
-<b>포착 근거:</b> {reasons_html} {mtf_html} {pattern_html}
-</div>
-{con_info}
-{whipsaw_html}
-<div class="strategy-grid">
-<div class="buy-box">
-<b>🔵 분할 매수 ({int(s['allocation']/10000)}만)</b><br>
-1차: <b>{s['buy'][0][0]:,}</b> <span style="font-size:0.8em">({s['buy'][0][3]}주, {s['buy'][0][2]}%)</span><br>
-2차: {s['buy'][1][0]:,} <span style="font-size:0.8em">({s['buy'][1][3]}주, {s['buy'][1][2]}%)</span><br>
-3차: {s['buy'][2][0]:,} <span style="font-size:0.8em">({s['buy'][2][3]}주, {s['buy'][2][2]}%)</span>
-</div>
-<div class="sell-box">
-<b>🔴 분할 매도</b><br>
-1차: <b>{s['sell'][0][0]:,}</b> <span style="font-size:0.8em">({s['sell'][0][2]}%)</span><br>
-2차: {s['sell'][1][0]:,} <span style="font-size:0.8em">({s['sell'][1][2]}%)</span><br>
-3차: {s['sell'][2][0]:,} <span style="font-size:0.8em">({s['sell'][2][2]}%)</span>
-</div>
-<div class="stop-box">
-<b>🛑 리스크 관리 (Stop)</b><br>
-{s['final_stop'][1]}: <b>{s['final_stop'][0]:,}</b><br>
-<span style="font-size:0.8em">(터치확률: {s['final_stop'][2]}%)</span>
-</div>
-</div>
-</div>
-"""
-                        st.markdown(analysis_html, unsafe_allow_html=True)
-                        col_dummy, col_send = st.columns([4, 1.5])
-                        with col_send:
-                            if st.button("✈️ 분석 결과 텔레그램 전송", key="btn_send_anl", use_container_width=True):
-                                if tg_token and tg_id:
-                                    msg = format_3split_msg(target_name, s, prefix="📊 <b>[정밀분석]</b> ")
-                                    send_telegram_msg(tg_token, tg_id, msg)
-                                    st.toast("전송 완료!", icon="✅")
-                                else: st.error("토큰 설정 필요")
-
-                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3], subplot_titles=("가격 및 이동평균선", "스토캐스틱"))
-                        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Candle', increasing_line_color='#ef5350', decreasing_line_color='#2962ff'), row=1, col=1)
-                        # Ichimoku Cloud (Span A, B fill)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['Ichi_SpanA'], line=dict(color='rgba(0,0,0,0)'), showlegend=False), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['Ichi_SpanB'], fill='tonexty', fillcolor='rgba(135, 206, 235, 0.2)', line=dict(color='rgba(0,0,0,0)'), name='구름대'), row=1, col=1)
-
-                        fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='blue', width=2), name='20일선'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='green', width=1.5), name='60일선'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['BB_Up'], line=dict(color='gray', width=1, dash='dot'), name='BB상단', showlegend=False), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lo'], line=dict(color='gray', width=1, dash='dot'), name='BB하단', showlegend=False), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['Stoch_5'], line=dict(color='#2962ff', width=1.5), name='Fast(5-3-3)'), row=2, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['Stoch_10'], line=dict(color='#00c853', width=1.5), name='Mid(10-6-6)'), row=2, col=1)
-                        fig.add_trace(go.Scatter(x=df.index, y=df['Stoch_20'], line=dict(color='#ff6d00', width=2), name='Slow(20-12-12)'), row=2, col=1)
-                        fig.add_hline(y=80, line_dash="dot", line_color="red", row=2, col=1)
-                        fig.add_hline(y=20, line_dash="dot", line_color="blue", row=2, col=1)
-                        fig.update_layout(height=700, template="plotly_white", xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                        st.plotly_chart(fig, use_container_width=True)
-
-with tabs[4]: # 관리 (GSheets Manual Input)
-    st.subheader("📝 내 포트폴리오 관리 (구글 시트 연동)")
-    st.info("타 증권사 계좌의 보유 종목을 수기로 입력하면 대시보드에서 분석됩니다.")
-    df_p = get_portfolio_gsheets()
-    with st.form("add_pf"):
-        c1, c2, c3 = st.columns(3)
-        n = c1.text_input("종목명 (정확히 입력)")
-        p = c2.number_input("평단가", min_value=0)
-        q = c3.number_input("수량", min_value=0)
-        if st.form_submit_button("추가 / 업데이트"):
-            try:
-                conn = st.connection("gsheets", type=GSheetsConnection)
-                m = krx_list[krx_list['Name']==n]
-                if not m.empty:
-                    code = m.iloc[0]['Code']
-                    if 'Code' in df_p.columns: df_p = df_p[df_p['Code'] != code]
-                    new_row = pd.DataFrame([[code, n, p, q]], columns=['Code','Name','Buy_Price','Qty'])
-                    updated_p = pd.concat([df_p, new_row], ignore_index=True)
-                    conn.update(worksheet="portfolio", data=updated_p)
-                    st.success(f"{n} 추가 완료!"); time.sleep(1); st.rerun()
-                else: st.error("정확한 종목명을 입력해주세요.")
-            except Exception as e: st.error(f"시트 연결 오류: {e}")
-    
-    if not df_p.empty:
-        st.write("▼ 현재 등록된 종목")
-        st.dataframe(df_p, use_container_width=True)
-        if st.button("선택 종목 삭제"): 
-             st.info("구글 스프레드시트에서 직접 행을 삭제해주세요.")
-
-with tabs[5]: # Recovery & Rebalance Tab
-    st.subheader("🔄 원금 회복 & 포트폴리오 시뮬레이터")
-    pf = get_portfolio_gsheets()
-    if pf.empty: st.warning("⚠️ 포트폴리오가 비어있습니다. [관리] 탭에서 종목을 먼저 추가해주세요.")
-    else:
-        st.markdown("#### 💰 전체 계좌 원금 회복 시나리오")
-        with st.spinner("전체 포트폴리오 정밀 분석 중..."):
-            total_buy = 0; total_eval = 0; weighted_vol_sum = 0; rebal_data = []
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                fut_map = {ex.submit(get_data_safe, row['Code'], 200): row for _, row in pf.iterrows()}
-                for fut in as_completed(fut_map):
-                    row = fut_map[fut]
-                    try:
-                        d, _ = fut.result()
-                        if d is not None and not d.empty:
-                            cp = d['Close'].iloc[-1]; val = cp * row['Qty']; buy_val = row['Buy_Price'] * row['Qty']
-                            total_buy += buy_val; total_eval += val
-                            profit_pct = (cp - row['Buy_Price']) / row['Buy_Price'] * 100
-                            daily_ret = d['Close'].pct_change().dropna()
-                            vol = daily_ret.std() * np.sqrt(252); weighted_vol_sum += (vol * val) 
-                            df_ind = get_all_indicators(d)
-                            if df_ind is not None:
-                                ai_s = get_ai_score_fast(df_ind)
-                                rebal_data.append({'name': row['Name'], 'code': row['Code'], 'score': ai_s, 'vol': vol, 'value': val, 'profit_pct': profit_pct})
-                    except: pass
-            
-            if total_eval > 0:
-                port_volatility = weighted_vol_sum / total_eval
-                total_loss_pct = (total_eval - total_buy) / total_buy * 100
-                t_stats = calc_recovery_math(total_buy, total_eval, port_volatility)
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("총 매수금", f"{int(total_buy):,}원"); c2.metric("총 평가금", f"{int(total_eval):,}원")
-                c3.metric("총 손익률", f"{total_loss_pct:.2f}%", delta_color="inverse")
-                if t_stats:
-                    c4.metric("원금회복 필요수익", f"+{t_stats['req_return']:.2f}%")
-                    st.markdown(f"""<div class="recovery-card">📊 <b>진단 결과:</b> 3개월(60영업일) 내 회복 확률: <span style="font-size:1.5em; color:#d32f2f; font-weight:bold;">{t_stats['prob_3m']:.1f}%</span></div>""", unsafe_allow_html=True)
-                
-                st.markdown("---")
-                st.markdown("#### ⚖️ AI & 수익률 기반 리밸런싱 제안")
-                rebal_res = analyze_rebalancing_suggestion(rebal_data)
-                if rebal_res:
-                    col_r1, col_r2 = st.columns(2)
-                    with col_r1:
-                        for rb in rebal_res[:len(rebal_res)//2 + 1]:
-                            st.markdown(f"""<div class="rebal-card" style="border-left: 5px solid {rb['color']}"><b>{rb['name']}</b> (AI:{rb['score']}점 / {rb['profit']:.1f}%) → <span style="color:{rb['color']}; font-weight:bold;">{rb['action']}</span><br><span style="color:#555; font-size:0.85em;">{rb['reason']}</span></div>""", unsafe_allow_html=True)
-                    with col_r2:
-                        for rb in rebal_res[len(rebal_res)//2 + 1:]:
-                            st.markdown(f"""<div class="rebal-card" style="border-left: 5px solid {rb['color']}"><b>{rb['name']}</b> (AI:{rb['score']}점 / {rb['profit']:.1f}%) → <span style="color:{rb['color']}; font-weight:bold;">{rb['action']}</span><br><span style="color:#555; font-size:0.85em;">{rb['reason']}</span></div>""", unsafe_allow_html=True)
-
-with tabs[6]:
-    st.subheader("📈 AI 성장 일기 (Portfolio Performance)")
-    
-    col_btn, _ = st.columns([1, 4])
-    with col_btn:
-        if st.button("🗑️ 기록 초기화", type="primary", use_container_width=True, key="del_final_v8158"):
-            try:
-                conn = st.connection("gsheets", type=GSheetsConnection)
-                empty_df = pd.DataFrame(columns=['Date', 'Code', 'Name', 'Entry_Price', 'Target_Price', 'Stop_Price', 'Strategy', 'Buys_Info', 'Sells_Info'])
-                conn.update(worksheet="history", data=empty_df)
-                st.cache_data.clear()
-                st.toast("초기화 완료!", icon="✨"); time.sleep(1); st.rerun()
-            except: pass
-
-    df_history = get_scan_history()
-
-    # [V81.58 Fix] Check for None explicitly before accessing .empty
-    if df_history is not None and not df_history.empty:
-        if 'Date' in df_history.columns:
-            df_history = df_history.sort_values('Date', ascending=False)
-
-        st.markdown("### 📊 Overall Statistics")
-        total_cnt = len(df_history)
-        try:
-            avg_plan_profit = ((pd.to_numeric(df_history['Target_Price'], errors='coerce') - pd.to_numeric(df_history['Entry_Price'], errors='coerce')) / pd.to_numeric(df_history['Entry_Price'], errors='coerce') * 100).mean()
-        except: avg_plan_profit = 0.0
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("📋 전체 포착", f"{total_cnt}개")
-        m2.metric("🎯 평균 목표수익", f"{avg_plan_profit:.1f}%")
-        
-        p_filled = m3.empty()
-        p_win = m4.empty()
-        p_filled.metric("🛒 실제 진입", "계산중...")
-        p_win.metric("💯 누적 승률", "계산중...")
-        
-        st.divider()
-
-        filled_cnt = 0 
-        win_cnt = 0      
-
-        st.caption(f"👇 총 {total_cnt}개 종목의 최신 시세와 컨센서스를 분석합니다...")
-        progress_bar = st.progress(0)
-
-        for i, (idx, row) in enumerate(df_history.iterrows()):
-            try:
-                progress_bar.progress((i + 1) / total_cnt)
-                code = str(row['Code']).zfill(6)
-                entry_p = float(row['Entry_Price'])
-                target_p = float(row['Target_Price'])
-
-                try:
-                    buys = json.loads(row.get('Buys_Info', '[]'))
-                    sells = json.loads(row.get('Sells_Info', '[]'))
-                except: buys, sells = [], []
-                
-                if not buys: buys = [entry_p]
-                if not sells: sells = [target_p]
-
-                curr_p, day_low, day_high = entry_p, 0, 0
-                try:
-                    df_now = fdr.DataReader(code, datetime.datetime.now() - timedelta(days=5))
-                    if not df_now.empty:
-                        curr_p = float(df_now['Close'].iloc[-1])
-                        day_low = float(df_now['Low'].min())
-                        day_high = float(df_now['High'].max())
-                except: pass
-
-                con_price, con_opinion = 0, 0.0
-                try:
-                    con_price, con_opinion = get_consensus_data(code)
-                except: pass
-
-                buy_step = 0
-                for bp in buys:
-                    if day_low <= float(bp) * 1.01: buy_step += 1
-                
-                sell_step = 0
-                if buy_step > 0:
-                    filled_cnt += 1 
-                    for sp in sells:
-                        if day_high >= float(sp): sell_step += 1
-                    if sell_step > 0: win_cnt += 1 
-
-                status_emoji = "⏳"
-                status_msg = "대기"
-                profit_str = ""
-                
-                if buy_step > 0:
-                    profit = (curr_p - float(buys[0])) / float(buys[0]) * 100
-                    profit_str = f"({profit:+.2f}%)"
-                    if sell_step > 0:
-                        status_emoji = "🎉"; status_msg = f"{sell_step}차 익절"
-                    else:
-                        status_emoji = "🔴" if profit > 0 else "🔵"
-                        status_msg = f"{buy_step}차 보유"
-                else:
-                    gap = (float(buys[0]) - curr_p) / curr_p * 100
-                    profit_str = f"(괴리 {gap:.1f}%)"
-                    status_msg = "미체결"
-
-                label = f"{status_emoji} **{row['Name']}** │ {status_msg} │ 현재: {curr_p:,.0f}원 {profit_str}"
-                
-                with st.expander(label):
-                    if con_price > 0:
-                        up_pot = (con_price - curr_p) / curr_p * 100
-                        con_msg = f"🎯 **증권사 컨센서스**: 목표가 **{con_price:,}원** (괴리율 {up_pot:+.1f}%) │ 투자의견: {con_opinion}/5.0"
-                        if up_pot > 0: st.info(con_msg)
-                        else: st.warning(con_msg)
-                    else:
-                        st.caption("📉 증권사 컨센서스(목표가) 데이터가 없습니다.")
-
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("##### 🔵 매수 단계 (Buying)")
-                        for idx_b, p in enumerate(buys):
-                            chk = "✅ **체결**" if day_low <= float(p)*1.01 else "⏳"
-                            st.write(f"- {idx_b+1}차: {float(p):,.0f}원 {chk}")
-                    with c2:
-                        st.markdown("##### 🔴 매도 단계 (Selling)")
-                        for idx_s, p in enumerate(sells):
-                            chk = "🎉 **달성**" if (buy_step > 0 and day_high >= float(p)) else "🎯"
-                            st.write(f"- {idx_s+1}차: {float(p):,.0f}원 {chk}")
-                    
-                    st.caption(f"Captured Strategy: {row['Strategy']}")
-
-            except Exception as e: continue
-        
-        progress_bar.empty()
-        win_rate = (win_cnt / filled_cnt * 100) if filled_cnt > 0 else 0.0
-        p_filled.metric("🛒 실제 진입", f"{filled_cnt}개")
-        p_win.metric("💯 누적 승률", f"{win_rate:.1f}%")
-
-    else: st.info("📭 기록이 없습니다.")
-
-with tabs[7]:
-    st.subheader("💾 AI 모델 동기화")
-    col_export, col_import = st.columns(2)
-    with col_export:
-        st.markdown("#### 📤 내보내기")
-        if os.path.exists(MODEL_FILE):
-            with open(MODEL_FILE, "rb") as f:
-                st.download_button(label="🧠 AI 모델 파일 다운로드 (.pkl)", data=f, file_name="ai_ensemble_model.pkl", mime="application/octet-stream")
-        else: st.warning("⚠️ 학습된 모델이 없습니다.")
-    with col_import:
-        st.markdown("#### 📥 가져오기")
-        uploaded_file = st.file_uploader("외부 모델 파일 업로드", type=["pkl"])
-        if uploaded_file is not None:
-            if st.button("🧠 모델 덮어쓰기"):
-                with open(MODEL_FILE, "wb") as f: f.write(uploaded_file.getbuffer())
-                st.success("✅ 적용 완료 (새로고침 필요)"); time.sleep(2); st.rerun()
-
-if 'generated_report' in st.session_state and st.session_state['generated_report']:
-    st.markdown("---"); st.subheader("📝 생성된 마감 리포트")
-    with st.expander("▼ 리포트 내용 확인하기 (클릭)", expanded=True):
-        st.markdown(st.session_state['generated_report'], unsafe_allow_html=True)
-        if st.button("닫기 (화면 지우기)"): del st.session_state['generated_report']; st.rerun()
-
-
-
+<p style="font-
